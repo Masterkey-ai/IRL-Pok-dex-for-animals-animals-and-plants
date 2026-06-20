@@ -13,24 +13,6 @@ pip install opencv-python numpy tensorflow pillow python-dotenv openai PyQt6
 
 ### 2. Set up your API key
 Create a `.env` file in this folder:
-fda
-cd /Users/tejo/Desktop/NatureDex
-cat > README.md << 'EOF'
-# NatureDex AI 🌿
-### An AI-Powered Wildlife Identification and Learning Platform
-*Congressional App Challenge Entry*
-
----
-
-## Quick Start
-
-### 1. Install dependencies
-```bash
-pip install opencv-python numpy tensorflow pillow python-dotenv openai PyQt6
-```
-
-### 2. Set up your API key
-Create a `.env` file in this folder:
 GROQ_API_KEY=your_groq_api_key_here
 
 ### 3. Run the app
