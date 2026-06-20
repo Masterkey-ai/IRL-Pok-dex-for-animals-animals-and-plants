@@ -1,0 +1,20 @@
+# Secrets — never commit your API key
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# macOS
+.DS_Store
+
+# NatureDex collection data (personal scan history, not project code)
+.naturedex_collection.json
+
+# Editor/IDE
+.vscode/
+.idea/
