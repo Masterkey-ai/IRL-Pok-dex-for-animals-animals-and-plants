@@ -39,8 +39,9 @@ from openai import OpenAI
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-COLLECTION_FILE = Path.home() / ".naturedex_collection.json"
+COLLECTION_FILE   = Path.home() / ".naturedex_collection.json"
 ACHIEVEMENTS_FILE = Path.home() / ".naturedex_achievements.json"
+CORRECTIONS_FILE  = Path.home() / ".naturedex_corrections.json"
 
 # ── The Ranger's Field Guide Color Palette ───────────────────────────────────
 # 60% Base: Deep desaturated forest — organic, not pitch black
@@ -1127,7 +1128,6 @@ class NatureDexWindow(QMainWindow):
         self._entry_inner.setContentsMargins(20, 20, 20, 20)
         self._entry_inner.setSpacing(14)
 
-        # Placeholder
         self._placeholder_lbl = QLabel("Scan an object to generate\na NatureDex entry.")
         self._placeholder_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder_lbl.setStyleSheet(f"""
@@ -1140,7 +1140,97 @@ class NatureDexWindow(QMainWindow):
         self._entry_inner.addStretch()
 
         scroll.setWidget(self._entry_content)
-        layout.addWidget(scroll)
+        layout.addWidget(scroll, stretch=1)
+
+        # ── Correction bar — hidden by default, shown inline when report clicked
+        self._correction_bar = QFrame()
+        self._correction_bar.setFixedHeight(50)
+        self._correction_bar.setStyleSheet(f"background: {C_CARD};")
+        cb_layout = QHBoxLayout(self._correction_bar)
+        cb_layout.setContentsMargins(16, 8, 16, 8)
+        cb_layout.setSpacing(8)
+
+        cb_prompt = QLabel("Correct name:")
+        cb_prompt.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px;")
+        cb_layout.addWidget(cb_prompt)
+
+        self._correction_input = QLineEdit()
+        self._correction_input.setPlaceholderText("e.g. Eastern Bluebird")
+        self._correction_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C_BG};
+                color: {C_TEXT};
+                border: none;
+                border-bottom: 1px solid {C_ACCENT};
+                border-radius: 0;
+                padding: 4px 6px;
+                font-size: 12px;
+            }}
+        """)
+        cb_layout.addWidget(self._correction_input, stretch=1)
+
+        cb_submit = QPushButton("Submit")
+        cb_submit.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb_submit.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_ACCENT};
+                color: #1a1f14;
+                border: none;
+                border-radius: 6px;
+                padding: 4px 14px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{ background: #f08020; }}
+        """)
+        cb_cancel = QPushButton("Cancel")
+        cb_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb_cancel.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {C_SUBTEXT};
+                border: none;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ color: {C_TEXT}; }}
+        """)
+        cb_layout.addWidget(cb_submit)
+        cb_layout.addWidget(cb_cancel)
+        self._correction_bar.hide()
+        layout.addWidget(self._correction_bar)
+
+        cb_submit.clicked.connect(self._on_correction_submit)
+        cb_cancel.clicked.connect(self._on_correction_cancel)
+        self._correction_input.returnPressed.connect(self._on_correction_submit)
+
+        # ── Footer — report button always visible at bottom-right
+        footer = QFrame()
+        footer.setFixedHeight(40)
+        footer.setStyleSheet(f"background: {C_BG};")
+        f_layout = QHBoxLayout(footer)
+        f_layout.setContentsMargins(16, 0, 16, 0)
+
+        self._report_btn = QPushButton("⚑  Wrong ID? Report it")
+        self._report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._report_btn.setEnabled(False)
+        self._report_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {C_SUBTEXT};
+                border: none;
+                font-size: 11px;
+                text-align: right;
+                padding: 0;
+            }}
+            QPushButton:enabled:hover {{ color: {C_ACCENT}; }}
+            QPushButton:disabled {{ color: {C_BORDER}; }}
+        """)
+        self._report_btn.clicked.connect(self._on_report_wrong_id)
+
+        f_layout.addStretch()
+        f_layout.addWidget(self._report_btn)
+        layout.addWidget(footer)
+
         return widget
 
     def _build_chat_tab(self):
@@ -1308,7 +1398,7 @@ class NatureDexWindow(QMainWindow):
         self._collection.append(result)
         self._save_collection()
         self._add_collection_card(result, prepend=True)
-        self._species_count_lbl.setText(f"◈  {len(self._collection)} discovered")
+        self._species_count_lbl.setText(f"{len(self._collection)} discovered")
         self._refresh_category_filter_options()
         self._apply_filters()
         self._check_achievements()
@@ -1316,6 +1406,7 @@ class NatureDexWindow(QMainWindow):
         self._render_entry(result)
         self._switch_tab(0)
         self._reset_chat()
+        self._report_btn.setEnabled(True)
 
     def _on_error(self, msg):
         self._scan_btn.stop_scanning()
@@ -1558,6 +1649,7 @@ class NatureDexWindow(QMainWindow):
         self._render_entry(entry_data)
         self._switch_tab(0)
         self._reset_chat()
+        self._report_btn.setEnabled(True)
 
     def _on_delete_entry(self, timestamp):
         if not timestamp:
@@ -1897,6 +1989,60 @@ If asked about North Carolina specifically, provide NC-relevant context."""
             COLLECTION_FILE.write_text(json.dumps(self._collection, indent=2))
         except Exception as e:
             print(f"Could not save collection: {e}")
+
+    # ── Correction / Feedback System ───────────────────────────────────────────
+
+    def _on_report_wrong_id(self):
+        if not self._current_result:
+            return
+        self._correction_input.clear()
+        self._correction_input.setPlaceholderText("e.g. Eastern Bluebird")
+        self._correction_bar.show()
+        self._correction_input.setFocus()
+
+    def _on_correction_submit(self):
+        text = self._correction_input.text().strip()
+        if not text:
+            self._correction_input.setPlaceholderText("Please enter a name")
+            return
+        self._save_correction(text)
+        self._correction_bar.hide()
+        self._correction_input.clear()
+        self._report_btn.setText("⚑  Thanks for the correction!")
+        QTimer.singleShot(3000, lambda: self._report_btn.setText("⚑  Wrong ID? Report it"))
+
+    def _on_correction_cancel(self):
+        self._correction_bar.hide()
+        self._correction_input.clear()
+
+    def _save_correction(self, correct_name: str):
+        """Append one correction record to the local corrections log.
+        Each record has everything needed for Phase 4 model training:
+        the original model label, user's correction, confidence, and timestamp."""
+        result = self._current_result or {}
+        entry = result.get("entry", {})
+
+        record = {
+            "timestamp":        datetime.datetime.now().isoformat(),
+            "original_label":   result.get("raw_label", ""),
+            "original_name":    result.get("name", ""),
+            "confidence":       result.get("confidence", 0),
+            "correct_name":     correct_name,
+            "scientific_name":  entry.get("scientific_name", ""),
+            "category":         entry.get("category", ""),
+            "inat_taxon_id":    result.get("inat", {}).get("taxon_id"),
+            "image_path":       result.get("image_path", ""),
+        }
+
+        try:
+            corrections = []
+            if CORRECTIONS_FILE.exists():
+                corrections = json.loads(CORRECTIONS_FILE.read_text())
+            corrections.append(record)
+            CORRECTIONS_FILE.write_text(json.dumps(corrections, indent=2))
+            print(f"[Correction saved] '{record['original_name']}' → '{correct_name}'")
+        except Exception as e:
+            print(f"Could not save correction: {e}")
 
     # ── Cleanup ────────────────────────────────────────────────────────────────
 
