@@ -36,12 +36,23 @@ from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, decode_predi
 from tensorflow.keras.preprocessing import image as keras_image
 from openai import OpenAI
 
+# PyTorch — custom NC wildlife model
+import torch
+import torch.nn.functional as F
+from torchvision import transforms, models as torch_models
+from PIL import Image as PILImage
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 COLLECTION_FILE   = Path.home() / ".naturedex_collection.json"
 ACHIEVEMENTS_FILE = Path.home() / ".naturedex_achievements.json"
 CORRECTIONS_FILE  = Path.home() / ".naturedex_corrections.json"
+
+# Custom NC model — sits in models/ folder next to naturedex.py
+_SCRIPT_DIR      = Path(__file__).parent
+CUSTOM_MODEL_PTH = _SCRIPT_DIR / "models" / "naturedex_nc_v1.pth"
+CUSTOM_MODEL_THRESHOLD = 60.0   # % — use custom model if confidence above this
 
 # ── The Ranger's Field Guide Color Palette ───────────────────────────────────
 # 60% Base: Deep desaturated forest — organic, not pitch black
@@ -201,6 +212,93 @@ def _nc_rarity_label(nc_count: int) -> str:
         return "Very Common in NC"
 
 
+# ─── Custom NC Model ──────────────────────────────────────────────────────────
+
+# Image transform matching what train_model.py used for validation
+_custom_transform = transforms.Compose([
+    transforms.Resize(int(224 * 1.1)),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
+
+def load_custom_model():
+    """Load the trained EfficientNetV2-S NC wildlife model.
+    Returns (model, label_map, device) or (None, None, None) if not found."""
+    if not CUSTOM_MODEL_PTH.exists():
+        print(f"[Custom model] Not found at {CUSTOM_MODEL_PTH} — using MobileNetV2 only")
+        return None, None, None
+
+    label_map_path = CUSTOM_MODEL_PTH.parent / "label_map.json"
+    if not label_map_path.exists():
+        print("[Custom model] label_map.json missing — skipping")
+        return None, None, None
+
+    try:
+        device = torch.device("cpu")   # Mac inference runs on CPU
+
+        checkpoint = torch.load(CUSTOM_MODEL_PTH, map_location=device, weights_only=False)
+        num_classes = checkpoint["num_classes"]
+
+        model = torch_models.efficientnet_v2_s(weights=None)
+        import torch.nn as nn
+        in_features = model.classifier[1].in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=0.3, inplace=True),
+            nn.Linear(in_features, num_classes),
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        model.to(device)
+
+        with open(label_map_path) as f:
+            label_map = json.load(f)
+
+        print(f"[Custom model] Loaded — {num_classes} NC species, "
+              f"val acc {checkpoint.get('val_accuracy', '?'):.1f}%")
+        return model, label_map, device
+
+    except Exception as e:
+        print(f"[Custom model] Failed to load: {e}")
+        return None, None, None
+
+
+@torch.no_grad()
+def run_custom_model(model, label_map, device, image_path: str):
+    """Run the custom model on an image. Returns (label, confidence, alternatives)
+    or None if model is unavailable."""
+    if model is None:
+        return None
+
+    try:
+        img = PILImage.open(image_path).convert("RGB")
+        tensor = _custom_transform(img).unsqueeze(0).to(device)
+        logits = model(tensor)
+        probs  = F.softmax(logits, dim=1)[0]
+
+        top5_probs, top5_idx = torch.topk(probs, min(5, len(label_map)))
+
+        top_idx   = top5_idx[0].item()
+        top_prob  = top5_probs[0].item() * 100
+        top_info  = label_map.get(str(top_idx), {})
+        top_label = top_info.get("common_name", f"Species {top_idx}")
+
+        alternatives = []
+        for prob, idx in zip(top5_probs[1:4], top5_idx[1:4]):
+            info = label_map.get(str(idx.item()), {})
+            alternatives.append({
+                "name":       info.get("common_name", f"Species {idx.item()}"),
+                "confidence": prob.item() * 100,
+            })
+
+        return top_label, top_prob, alternatives, top_info
+
+    except Exception as e:
+        print(f"[Custom model] Inference error: {e}")
+        return None
+
+
 # ─── Worker Threads ────────────────────────────────────────────────────────────
 
 class CameraThread(QThread):
@@ -236,11 +334,14 @@ class AnalysisWorker(QThread):
     result_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, frame, model, client):
+    def __init__(self, frame, model, client, custom_model=None, custom_label_map=None, custom_device=None):
         super().__init__()
-        self.frame = frame
-        self.model = model
-        self.client = client
+        self.frame            = frame
+        self.model            = model        # MobileNetV2 (TensorFlow fallback)
+        self.client           = client
+        self.custom_model     = custom_model
+        self.custom_label_map = custom_label_map
+        self.custom_device    = custom_device
 
     def run(self):
         try:
@@ -248,46 +349,72 @@ class AnalysisWorker(QThread):
             tmp_path = "/tmp/naturedex_scan.jpg"
             cv2.imwrite(tmp_path, self.frame)
 
-            # ── Step 1: MobileNetV2 classification ────────────────────────────
-            img = keras_image.load_img(tmp_path, target_size=(224, 224))
-            arr = keras_image.img_to_array(img)
-            arr = np.expand_dims(arr, axis=0)
-            arr = preprocess_input(arr)
-            preds = self.model.predict(arr, verbose=0)
-            decoded = decode_predictions(preds, top=5)[0]
+            # ── Step 1: Try custom NC model first ────────────────────────────
+            used_custom = False
+            custom_result = run_custom_model(
+                self.custom_model, self.custom_label_map,
+                self.custom_device, tmp_path
+            )
 
-            top = decoded[0]
-            label = top[1].replace("_", " ").title()
-            confidence = top[2] * 100
-            alternatives = [
-                {"name": d[1].replace("_", " ").title(), "confidence": d[2] * 100}
-                for d in decoded[1:4]
-            ]
+            if custom_result and custom_result[1] >= CUSTOM_MODEL_THRESHOLD:
+                # Custom model is confident — use it
+                label, confidence, alternatives, top_info = custom_result
+                raw_label = label.lower().replace(" ", "_")
+                used_custom = True
+                model_source = "NatureDex NC Model (89% accuracy)"
+            else:
+                # ── Step 1b: Fall back to MobileNetV2 ────────────────────────
+                img = keras_image.load_img(tmp_path, target_size=(224, 224))
+                arr = keras_image.img_to_array(img)
+                arr = np.expand_dims(arr, axis=0)
+                arr = preprocess_input(arr)
+                preds = self.model.predict(arr, verbose=0)
+                decoded = decode_predictions(preds, top=5)[0]
 
-            # ── Step 2: iNaturalist lookup for real species data ──────────────
-            # Runs in this worker thread so the UI stays responsive.
-            # inat_data is an empty dict if the network is unavailable —
-            # _generate_entry handles that gracefully.
+                top = decoded[0]
+                label       = top[1].replace("_", " ").title()
+                confidence  = top[2] * 100
+                raw_label   = top[1]
+                alternatives = [
+                    {"name": d[1].replace("_", " ").title(), "confidence": d[2] * 100}
+                    for d in decoded[1:4]
+                ]
+                model_source = "MobileNetV2 (ImageNet)"
+
+                # If custom model ran but wasn't confident, still note its top guess
+                if custom_result:
+                    print(f"[Model] Custom model low confidence ({custom_result[1]:.1f}%) "
+                          f"— using MobileNetV2 fallback")
+
+            # ── Step 2: iNaturalist lookup ────────────────────────────────────
             inat_data = inat_lookup(label)
 
-            # ── Step 3: Groq entry generation, grounded in iNat data ─────────
+            # If custom model ran, use its taxon_id for more accurate iNat lookup
+            if used_custom and top_info.get("taxon_id"):
+                inat_data["taxon_id"]    = top_info["taxon_id"]
+                inat_data["iconic_taxon"] = top_info.get("iconic_group", "")
+                if not inat_data.get("nc_observations"):
+                    inat_data["nc_observations"] = _get_nc_count(top_info["taxon_id"])
+
+            # ── Step 3: Groq entry generation ────────────────────────────────
             entry = self._generate_entry(label, confidence, inat_data)
 
-            # Compute rarity label from NC observation count
             nc_count = inat_data.get("nc_observations", 0)
-            rarity = _nc_rarity_label(nc_count)
+            rarity   = _nc_rarity_label(nc_count)
 
             result = {
-                "name": inat_data.get("common_name") or label,
-                "raw_label": top[1],
-                "confidence": confidence,
-                "alternatives": alternatives,
-                "entry": entry,
-                "inat": inat_data,        # stored for future map/rarity features
-                "rarity": rarity,
-                "nc_observations": nc_count,
-                "timestamp": datetime.datetime.now().isoformat(),
-                "image_path": tmp_path,
+                "name":           inat_data.get("common_name") or label,
+                "raw_label":      raw_label,
+                "confidence":     confidence,
+                "alternatives":   alternatives,
+                "entry":          entry,
+                "inat":           inat_data,
+                "rarity":         rarity,
+                "nc_observations":nc_count,
+                "model_source":   model_source,
+                "used_custom_model": used_custom,
+                "timestamp":      datetime.datetime.now().isoformat(),
+                "image_path":     tmp_path,
             }
             self.result_ready.emit(result)
 
@@ -752,8 +879,11 @@ class NatureDexWindow(QMainWindow):
         self._toast = None
 
         # Load AI models
-        self._model = None
+        self._model = None           # MobileNetV2 fallback
         self._client = None
+        self._custom_model = None    # custom NC EfficientNetV2 model
+        self._custom_label_map = None
+        self._custom_device = None
         self._models_loaded = False
 
         self._setup_style()
@@ -1336,15 +1466,18 @@ class NatureDexWindow(QMainWindow):
     def _load_models_async(self):
         def _load():
             try:
+                # Load custom NC model first (faster than MobileNetV2 to load)
+                self._custom_model, self._custom_label_map, self._custom_device = \
+                    load_custom_model()
+
+                # Always load MobileNetV2 as fallback
                 self._model = MobileNetV2(weights="imagenet")
+
                 self._client = OpenAI(
                     api_key=GROQ_API_KEY,
                     base_url="https://api.groq.com/openai/v1",
                 )
                 self._models_loaded = True
-                # Emit signal to update UI safely from the main thread.
-                # QTimer.singleShot from a background thread is unreliable —
-                # signals are the correct Qt cross-thread mechanism.
                 self.model_status_signal.emit("ready")
             except Exception as e:
                 self.model_status_signal.emit(f"error:{e}")
@@ -1381,7 +1514,12 @@ class NatureDexWindow(QMainWindow):
             self._scan_overlay.show()
             self._scan_overlay.start()
 
-        self._analysis_worker = AnalysisWorker(frame, self._model, self._client)
+        self._analysis_worker = AnalysisWorker(
+            frame, self._model, self._client,
+            custom_model=self._custom_model,
+            custom_label_map=self._custom_label_map,
+            custom_device=self._custom_device,
+        )
         self._analysis_worker.result_ready.connect(self._on_result)
         self._analysis_worker.error_occurred.connect(self._on_error)
         self._analysis_worker.start()
@@ -1469,6 +1607,16 @@ class NatureDexWindow(QMainWindow):
         conf_lbl.setStyleSheet(f"color: {conf_color}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
         conf_row.addWidget(conf_lbl)
 
+        # Show which model identified this — custom NC model or MobileNetV2 fallback
+        used_custom = result.get("used_custom_model", False)
+        model_badge = QLabel("🌿 NatureDex Model" if used_custom else "⚙ MobileNetV2")
+        model_badge.setStyleSheet(f"""
+            color: {C_ACCENT if used_custom else C_SUBTEXT};
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        """)
+
         if cat:
             cat_badge = QLabel(f"  {cat}  ")
             cat_badge.setStyleSheet(f"""
@@ -1481,6 +1629,7 @@ class NatureDexWindow(QMainWindow):
                 letter-spacing: 1px;
             """)
             conf_row.addWidget(cat_badge)
+        conf_row.addWidget(model_badge)
         conf_row.addStretch()
         nf_layout.addLayout(conf_row)
 
