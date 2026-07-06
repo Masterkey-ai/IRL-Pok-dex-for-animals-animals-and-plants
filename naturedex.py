@@ -371,6 +371,11 @@ class AnalysisWorker(QThread):
             nc_count = inat_data.get("nc_observations", 0)
             rarity   = _nc_rarity_label(nc_count)
 
+            # Generate phonetic pronunciation for the scientific name
+            sci_name = (entry.get("scientific_name") or
+                        inat_data.get("scientific_name") or "")
+            phonetic = self._get_phonetic(sci_name) if sci_name else ""
+
             self.result_ready.emit({
                 "name":              inat_data.get("common_name") or label,
                 "raw_label":         raw_label,
@@ -382,6 +387,7 @@ class AnalysisWorker(QThread):
                 "nc_observations":   nc_count,
                 "model_source":      model_source,
                 "used_custom_model": used_custom,
+                "phonetic":          phonetic,
                 "timestamp":         datetime.datetime.now().isoformat(),
                 "image_path":        tmp_path,
             })
@@ -482,6 +488,30 @@ Return ONLY the JSON object. No other text."""
                 "fun_fact":              "Analysis unavailable.",
                 "description":           "Entry generation failed — try scanning again.",
             }
+
+    def _get_phonetic(self, scientific_name: str) -> str:
+        """Ask Groq to convert a Latin scientific name into an English phonetic
+        pronunciation guide. Returns a string like 'sy-AY-lee-ah sy-AY-lis'
+        or empty string on failure. Runs in the worker thread — never blocks UI."""
+        if not scientific_name or scientific_name in ("Unknown", ""):
+            return ""
+        try:
+            prompt = (
+                f"Convert this scientific name to a simple English phonetic "
+                f"pronunciation guide using syllables and capital letters for stress. "
+                f"Reply with ONLY the pronunciation, nothing else. "
+                f"Example: 'Sialia sialis' → 'sy-AY-lee-ah sy-AY-lis'\n\n"
+                f"Scientific name: {scientific_name}"
+            )
+            resp = self.client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=60,
+            )
+            return resp.choices[0].message.content.strip().strip('"\'')
+        except Exception:
+            return ""
 
 
 class ChatWorker(QThread):
@@ -1636,10 +1666,51 @@ class NatureDexWindow(QMainWindow):
         nf_layout.addWidget(name_lbl)
 
         if sci and sci != "Unknown":
+            sci_row = QHBoxLayout()
+            sci_row.setSpacing(8)
+
+            # Scientific name in italic
             sci_lbl = QLabel(sci)
             sci_lbl.setStyleSheet(
-                f"color: {C_SUBTEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px;")
-            nf_layout.addWidget(sci_lbl)
+                f"color: {C_TEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px; opacity: 0.85;")
+            sci_row.addWidget(sci_lbl)
+
+            # Phonetic pronunciation if available
+            phonetic = result.get("phonetic", "")
+            if phonetic:
+                phon_lbl = QLabel(f"  {phonetic}")
+                phon_lbl.setStyleSheet(
+                    f"color: {C_SUBTEXT}; font-size: 10px; letter-spacing: 0.3px;")
+                sci_row.addWidget(phon_lbl)
+
+            sci_row.addStretch()
+
+            # Speaker button — calls macOS 'say' to read the scientific name aloud
+            if sci:
+                speak_btn = QPushButton("🔊")
+                speak_btn.setFixedSize(24, 24)
+                speak_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                speak_btn.setToolTip(f"Hear pronunciation of '{sci}'")
+                speak_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: transparent;
+                        border: none;
+                        font-size: 13px;
+                        padding: 0;
+                    }}
+                    QPushButton:hover {{ background: {C_CARD}; border-radius: 4px; }}
+                """)
+                _sci = sci  # capture for lambda
+                speak_btn.clicked.connect(
+                    lambda checked, s=_sci: subprocess.Popen(
+                        ["say", "-v", "Samantha", "-r", "120", s],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                )
+                sci_row.addWidget(speak_btn)
+
+            nf_layout.addLayout(sci_row)
 
         conf       = result["confidence"]
         conf_color = C_GREEN if conf >= 75 else C_YELLOW if conf >= 50 else C_RED
