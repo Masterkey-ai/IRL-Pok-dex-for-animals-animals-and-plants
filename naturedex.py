@@ -78,14 +78,39 @@ C_SCAN_LINE  = C_ACCENT
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 ACHIEVEMENTS = [
-    {"id": "first_scan",  "type": "count",    "threshold": 1,  "icon": "🔍", "name": "First Discovery",    "desc": "Scan your first object"},
-    {"id": "count_5",     "type": "count",    "threshold": 5,  "icon": "🌱", "name": "Budding Naturalist", "desc": "Discover 5 species"},
-    {"id": "count_10",    "type": "count",    "threshold": 10, "icon": "🌿", "name": "Field Explorer",     "desc": "Discover 10 species"},
-    {"id": "count_25",    "type": "count",    "threshold": 25, "icon": "🌳", "name": "Wildlife Tracker",   "desc": "Discover 25 species"},
-    {"id": "count_50",    "type": "count",    "threshold": 50, "icon": "🏆", "name": "Master Naturalist",  "desc": "Discover 50 species"},
-    {"id": "cats_3",      "type": "category", "threshold": 3,  "icon": "🎯", "name": "Well-Rounded",       "desc": "Discover 3 different categories"},
-    {"id": "cats_5",      "type": "category", "threshold": 5,  "icon": "🧭", "name": "Diverse Explorer",   "desc": "Discover 5 different categories"},
-    {"id": "cats_7",      "type": "category", "threshold": 7,  "icon": "🌍", "name": "Renaissance Scout",  "desc": "Discover 7 different categories"},
+    # ── Discovery count ────────────────────────────────────────────────────────
+    {"id": "first_scan",  "type": "count",      "threshold": 1,   "icon": "🔍", "name": "First Discovery",      "desc": "Scan your first species"},
+    {"id": "count_5",     "type": "count",      "threshold": 5,   "icon": "🌱", "name": "Budding Naturalist",   "desc": "Discover 5 species"},
+    {"id": "count_10",    "type": "count",      "threshold": 10,  "icon": "🌿", "name": "Field Explorer",       "desc": "Discover 10 species"},
+    {"id": "count_25",    "type": "count",      "threshold": 25,  "icon": "🌳", "name": "Wildlife Tracker",     "desc": "Discover 25 species"},
+    {"id": "count_50",    "type": "count",      "threshold": 50,  "icon": "🦅", "name": "Master Naturalist",    "desc": "Discover 50 species"},
+    {"id": "count_100",   "type": "count",      "threshold": 100, "icon": "🏆", "name": "NatureDex Legend",     "desc": "Discover 100 species"},
+
+    # ── Category diversity ─────────────────────────────────────────────────────
+    {"id": "cats_3",      "type": "category",   "threshold": 3,   "icon": "🎯", "name": "Well-Rounded",         "desc": "Find 3 different categories"},
+    {"id": "cats_5",      "type": "category",   "threshold": 5,   "icon": "🧭", "name": "Diverse Explorer",     "desc": "Find 5 different categories"},
+    {"id": "cats_7",      "type": "category",   "threshold": 7,   "icon": "🌍", "name": "Renaissance Scout",    "desc": "Find 7 different categories"},
+
+    # ── Rarity finds ───────────────────────────────────────────────────────────
+    {"id": "rare_1",      "type": "rarity",     "threshold": 1,   "icon": "💎", "name": "Rare Find",            "desc": "Discover a Rare or Very Rare NC species"},
+    {"id": "rare_5",      "type": "rarity",     "threshold": 5,   "icon": "🔮", "name": "Rarity Hunter",        "desc": "Discover 5 Rare or Very Rare NC species"},
+
+    # ── Endangered species ─────────────────────────────────────────────────────
+    {"id": "endanger_1",  "type": "endangered", "threshold": 1,   "icon": "🚨", "name": "Conservationist",      "desc": "Scan a Vulnerable, Endangered, or Critically Endangered species"},
+    {"id": "endanger_3",  "type": "endangered", "threshold": 3,   "icon": "🛡️", "name": "Species Guardian",     "desc": "Find 3 threatened species"},
+
+    # ── NC native finds ────────────────────────────────────────────────────────
+    {"id": "nc_1",        "type": "nc_common",  "threshold": 1,   "icon": "🌲", "name": "Tar Heel Spotter",     "desc": "Find a species Common in NC"},
+    {"id": "nc_5",        "type": "nc_common",  "threshold": 5,   "icon": "🏔️", "name": "Carolina Naturalist",  "desc": "Find 5 species Common in NC"},
+    {"id": "nc_10",       "type": "nc_common",  "threshold": 10,  "icon": "🌾", "name": "NC Wildlife Expert",   "desc": "Find 10 species Common in NC"},
+
+    # ── Custom model ───────────────────────────────────────────────────────────
+    {"id": "custom_1",    "type": "custom",     "threshold": 1,   "icon": "🤖", "name": "AI Identified",        "desc": "Get a result from the custom NC model"},
+    {"id": "custom_10",   "type": "custom",     "threshold": 10,  "icon": "🧬", "name": "Model Tested",         "desc": "Get 10 results from the custom NC model"},
+
+    # ── Corrections ────────────────────────────────────────────────────────────
+    {"id": "correct_1",   "type": "correct",    "threshold": 1,   "icon": "✏️", "name": "Fact Checker",         "desc": "Submit your first correction"},
+    {"id": "correct_5",   "type": "correct",    "threshold": 5,   "icon": "📚", "name": "Data Contributor",     "desc": "Submit 5 corrections to improve the model"},
 ]
 
 NC_PLACE_ID = 51
@@ -1900,14 +1925,56 @@ class NatureDexWindow(QMainWindow):
             e.get("entry", {}).get("category", "Unknown") or "Unknown"
             for e in self._collection
         })
+
+        # Count rare/very rare NC species
+        n_rare = sum(
+            1 for e in self._collection
+            if any(w in e.get("rarity", "")
+                   for w in ("Rare in NC", "Very Rare in NC", "Not Recorded in NC"))
+        )
+
+        # Count threatened/endangered species
+        endangered_statuses = {"vulnerable", "endangered", "critically endangered"}
+        n_endangered = sum(
+            1 for e in self._collection
+            if e.get("entry", {}).get("conservation_status", "").lower()
+            in endangered_statuses
+        )
+
+        # Count species Common in NC
+        n_nc = sum(
+            1 for e in self._collection
+            if "Common in NC" in e.get("rarity", "")
+        )
+
+        # Count custom model identifications
+        n_custom = sum(
+            1 for e in self._collection
+            if e.get("used_custom_model", False)
+        )
+
+        # Count corrections submitted
+        n_correct = 0
+        if CORRECTIONS_FILE.exists():
+            try:
+                n_correct = len(json.loads(CORRECTIONS_FILE.read_text()))
+            except Exception:
+                pass
+
         newly = []
         for badge in ACHIEVEMENTS:
             if badge["id"] in self._unlocked_achievements:
                 continue
-            if badge["type"] == "count"    and count  >= badge["threshold"]:
-                newly.append(badge)
-            elif badge["type"] == "category" and n_cats >= badge["threshold"]:
-                newly.append(badge)
+            t = badge["type"]
+            thr = badge["threshold"]
+            if   t == "count"      and count       >= thr: newly.append(badge)
+            elif t == "category"   and n_cats       >= thr: newly.append(badge)
+            elif t == "rarity"     and n_rare        >= thr: newly.append(badge)
+            elif t == "endangered" and n_endangered  >= thr: newly.append(badge)
+            elif t == "nc_common"  and n_nc          >= thr: newly.append(badge)
+            elif t == "custom"     and n_custom      >= thr: newly.append(badge)
+            elif t == "correct"    and n_correct     >= thr: newly.append(badge)
+
         if not newly:
             return
         for badge in newly:
@@ -1919,17 +1986,61 @@ class NatureDexWindow(QMainWindow):
                 lambda b=badge: self._toast.show_achievement(b["icon"], b["name"]))
 
     def _show_badges_panel(self):
+        # ── Compute current stats for progress bars ────────────────────────────
+        count  = len(self._collection)
+        n_cats = len({
+            e.get("entry", {}).get("category", "Unknown") or "Unknown"
+            for e in self._collection
+        })
+        n_rare = sum(
+            1 for e in self._collection
+            if any(w in e.get("rarity", "")
+                   for w in ("Rare in NC", "Very Rare in NC", "Not Recorded in NC"))
+        )
+        endangered_statuses = {"vulnerable", "endangered", "critically endangered"}
+        n_endangered = sum(
+            1 for e in self._collection
+            if e.get("entry", {}).get("conservation_status", "").lower()
+            in endangered_statuses
+        )
+        n_nc = sum(
+            1 for e in self._collection
+            if "Common in NC" in e.get("rarity", "")
+        )
+        n_custom = sum(
+            1 for e in self._collection
+            if e.get("used_custom_model", False)
+        )
+        n_correct = 0
+        if CORRECTIONS_FILE.exists():
+            try:
+                n_correct = len(json.loads(CORRECTIONS_FILE.read_text()))
+            except Exception:
+                pass
+
+        def _progress(badge: dict) -> tuple[int, int]:
+            """Return (current, max) for a badge's progress bar."""
+            t   = badge["type"]
+            thr = badge["threshold"]
+            val = {"count": count, "category": n_cats, "rarity": n_rare,
+                   "endangered": n_endangered, "nc_common": n_nc,
+                   "custom": n_custom, "correct": n_correct}.get(t, 0)
+            return min(val, thr), thr
+
+        # ── Build panel ────────────────────────────────────────────────────────
         panel = QFrame(self)
         panel.setStyleSheet(f"background: {C_PANEL}; border-radius: 12px;")
-        panel.setFixedSize(360, 460)
-        panel.move((self.width() - 360) // 2, (self.height() - 460) // 2)
+        panel.setFixedSize(400, 520)
+        panel.move((self.width() - 400) // 2, (self.height() - 520) // 2)
 
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(0)
 
+        # Header
         header_row = QHBoxLayout()
-        title = QLabel("Achievements")
+        n_unlocked = len(self._unlocked_achievements)
+        title = QLabel(f"Achievements  {n_unlocked}/{len(ACHIEVEMENTS)}")
         title.setStyleSheet(f"color: {C_TEXT}; font-size: 16px; font-weight: 800;")
         close_btn = QLabel("✕")
         close_btn.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 16px;")
@@ -1952,20 +2063,27 @@ class NatureDexWindow(QMainWindow):
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(0)
 
-        for badge in ACHIEVEMENTS:
+        for i, badge in enumerate(ACHIEVEMENTS):
             unlocked = badge["id"] in self._unlocked_achievements
+            cur, mx  = _progress(badge)
+
             row = QWidget()
             row.setStyleSheet("background: transparent;")
-            r_layout = QHBoxLayout(row)
-            r_layout.setContentsMargins(0, 8, 0, 8)
-            r_layout.setSpacing(14)
-            icon = QLabel(badge["icon"] if unlocked else "🔒")
-            icon.setStyleSheet(
-                f"font-size: 18px; color: {'inherit' if unlocked else C_SUBTEXT};")
-            icon.setFixedWidth(26)
-            r_layout.addWidget(icon)
-            text_box = QVBoxLayout()
-            text_box.setSpacing(2)
+            r_layout = QVBoxLayout(row)
+            r_layout.setContentsMargins(0, 10, 0, 10)
+            r_layout.setSpacing(5)
+
+            # Top line: icon + name + checkmark or pct
+            top = QHBoxLayout()
+            top.setSpacing(12)
+
+            icon_lbl = QLabel(badge["icon"] if unlocked else "🔒")
+            icon_lbl.setFixedWidth(26)
+            icon_lbl.setStyleSheet("font-size: 18px;")
+            top.addWidget(icon_lbl)
+
+            info = QVBoxLayout()
+            info.setSpacing(1)
             name_lbl = QLabel(badge["name"])
             name_lbl.setStyleSheet(
                 f"color: {C_TEXT}; font-size: 12px; font-weight: 700;"
@@ -1974,17 +2092,47 @@ class NatureDexWindow(QMainWindow):
             )
             desc_lbl = QLabel(badge["desc"])
             desc_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px;")
-            text_box.addWidget(name_lbl)
-            text_box.addWidget(desc_lbl)
-            r_layout.addLayout(text_box)
-            r_layout.addStretch()
+            info.addWidget(name_lbl)
+            info.addWidget(desc_lbl)
+            top.addLayout(info)
+            top.addStretch()
+
             if unlocked:
                 check = QLabel("✓")
                 check.setStyleSheet(
-                    f"color: {C_ACCENT}; font-size: 14px; font-weight: 800;")
-                r_layout.addWidget(check)
+                    f"color: {C_ACCENT}; font-size: 14px; font-weight: 900;")
+                top.addWidget(check)
+            else:
+                pct_lbl = QLabel(f"{cur}/{mx}")
+                pct_lbl.setStyleSheet(
+                    f"color: {C_SUBTEXT}; font-size: 10px; font-weight: 600;")
+                top.addWidget(pct_lbl)
+
+            r_layout.addLayout(top)
+
+            # Progress bar — always shown (full orange if unlocked)
+            bar = QProgressBar()
+            bar.setRange(0, mx)
+            bar.setValue(cur if not unlocked else mx)
+            bar.setFixedHeight(4)
+            bar.setTextVisible(False)
+            bar_color = C_ACCENT if unlocked else C_BORDER
+            bar.setStyleSheet(f"""
+                QProgressBar {{
+                    background: {C_CARD};
+                    border-radius: 2px;
+                    border: none;
+                    margin-left: 38px;
+                }}
+                QProgressBar::chunk {{
+                    background: {bar_color};
+                    border-radius: 2px;
+                }}
+            """)
+            r_layout.addWidget(bar)
             c_layout.addWidget(row)
-            if badge != ACHIEVEMENTS[-1]:
+
+            if i < len(ACHIEVEMENTS) - 1:
                 line = QFrame()
                 line.setFixedHeight(1)
                 line.setStyleSheet(f"background: {C_BORDER};")
