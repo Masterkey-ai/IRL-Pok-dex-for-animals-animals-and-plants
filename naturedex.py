@@ -371,10 +371,12 @@ class AnalysisWorker(QThread):
             nc_count = inat_data.get("nc_observations", 0)
             rarity   = _nc_rarity_label(nc_count)
 
-            # Generate phonetic pronunciation for the scientific name
+            # Generate phonetic pronunciation for any real scientific name
             sci_name = (entry.get("scientific_name") or
                         inat_data.get("scientific_name") or "")
-            phonetic = self._get_phonetic(sci_name) if sci_name else ""
+            phonetic = (self._get_phonetic(sci_name)
+                        if sci_name and sci_name not in ("Unknown", "N/A", "")
+                        else "")
 
             self.result_ready.emit({
                 "name":              inat_data.get("common_name") or label,
@@ -490,26 +492,46 @@ Return ONLY the JSON object. No other text."""
             }
 
     def _get_phonetic(self, scientific_name: str) -> str:
-        """Ask Groq to convert a Latin scientific name into an English phonetic
-        pronunciation guide. Returns a string like 'sy-AY-lee-ah sy-AY-lis'
-        or empty string on failure. Runs in the worker thread — never blocks UI."""
-        if not scientific_name or scientific_name in ("Unknown", ""):
+        """Generate accurate phonetic pronunciation for a Latin scientific name.
+        Only runs for real binomial names (genus + species).
+        Uses Groq with a strict prompt grounded in biological Latin rules."""
+        if not scientific_name:
             return ""
+        if scientific_name.lower().strip() in ("unknown", "n/a", ""):
+            return ""
+
         try:
             prompt = (
-                f"Convert this scientific name to a simple English phonetic "
-                f"pronunciation guide using syllables and capital letters for stress. "
-                f"Reply with ONLY the pronunciation, nothing else. "
-                f"Example: 'Sialia sialis' → 'sy-AY-lee-ah sy-AY-lis'\n\n"
-                f"Scientific name: {scientific_name}"
+                "You are a biology professor who pronounces Latin scientific names. "
+                "Convert this scientific name to a phonetic pronunciation guide "
+                "following these strict rules:\n"
+                "- Use hyphens between syllables\n"
+                "- CAPITALIZE the stressed syllable\n"
+                "- 'ae' = ee, 'oe' = ee, 'c' before e/i = s, 'ch' = k, "
+                "'g' before e/i = j, 'ph' = f, final 'a' = ah, "
+                "final 'us' = us, final 'is' = is\n"
+                "- Stress: second-to-last syllable if it ends in a consonant "
+                "or has two vowels, otherwise third-to-last\n"
+                "Reply with ONLY the phonetic guide for each word separated by a space. "
+                "No explanation. No punctuation other than hyphens.\n\n"
+                f"Scientific name: {scientific_name}\n"
+                "Examples:\n"
+                "Sialia sialis → sy-AY-lee-ah sy-AY-lis\n"
+                "Cardinalis cardinalis → kar-DIN-ah-lis kar-DIN-ah-lis\n"
+                "Danaus plexippus → DAN-ay-us plek-SIP-us\n"
+                "Pantherophis alleghaniensis → pan-THEHR-oh-fis al-eh-GAY-nee-EN-sis"
             )
             resp = self.client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=60,
+                temperature=0.1,   # very low — we want consistent rule-following
+                max_tokens=80,
             )
-            return resp.choices[0].message.content.strip().strip('"\'')
+            result = resp.choices[0].message.content.strip().strip('"\'')
+            # Sanity check — should have hyphens and look like phonetics
+            if "-" in result and len(result) > 3:
+                return result
+            return ""
         except Exception:
             return ""
 
@@ -1665,18 +1687,21 @@ class NatureDexWindow(QMainWindow):
         """)
         nf_layout.addWidget(name_lbl)
 
-        if sci and sci != "Unknown":
+        # Show speaker button for any real scientific name (genus-only or binomial)
+        has_real_sci = bool(sci and sci not in ("Unknown", "N/A", "")
+                            and len(sci.strip()) > 2)
+
+        if sci and sci not in ("Unknown", "N/A", ""):
             sci_row = QHBoxLayout()
             sci_row.setSpacing(8)
 
-            # Scientific name in italic
             sci_lbl = QLabel(sci)
             sci_lbl.setStyleSheet(
-                f"color: {C_TEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px; opacity: 0.85;")
+                f"color: {C_TEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px;")
             sci_row.addWidget(sci_lbl)
 
-            # Phonetic pronunciation if available
-            phonetic = result.get("phonetic", "")
+            # Phonetic — only show if we have a real binomial name
+            phonetic = result.get("phonetic", "") if has_real_sci else ""
             if phonetic:
                 phon_lbl = QLabel(f"  {phonetic}")
                 phon_lbl.setStyleSheet(
@@ -1685,8 +1710,8 @@ class NatureDexWindow(QMainWindow):
 
             sci_row.addStretch()
 
-            # Speaker button — calls macOS 'say' to read the scientific name aloud
-            if sci:
+            # Speaker button — ONLY when we have a real binomial scientific name
+            if has_real_sci:
                 speak_btn = QPushButton("🔊")
                 speak_btn.setFixedSize(24, 24)
                 speak_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1700,10 +1725,9 @@ class NatureDexWindow(QMainWindow):
                     }}
                     QPushButton:hover {{ background: {C_CARD}; border-radius: 4px; }}
                 """)
-                _sci = sci  # capture for lambda
                 speak_btn.clicked.connect(
-                    lambda checked, s=_sci: subprocess.Popen(
-                        ["say", "-v", "Samantha", "-r", "120", s],
+                    lambda checked, s=sci: subprocess.Popen(
+                        ["say", "-v", "Samantha", "-r", "110", s],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
@@ -1814,6 +1838,12 @@ class NatureDexWindow(QMainWindow):
         elif nc_obs == 0 and nc_context not in ("Unknown", "N/A", ""):
             nc_context = f"{nc_context}  (No research-grade iNaturalist observations recorded in NC)"
 
+        # Determine if this is a non-living object (so we can adjust labels)
+        category  = entry.get("category", "").lower()
+        is_object = any(w in category for w in
+                        ("object", "food", "vehicle", "furniture",
+                         "tool", "device", "clothing", "instrument"))
+
         fields = [
             ("🌿  HABITAT",        entry.get("habitat", "")),
             ("🍃  DIET",           entry.get("diet", "")),
@@ -1824,11 +1854,19 @@ class NatureDexWindow(QMainWindow):
         ]
         delay = 160
         for icon_label, value in fields:
-            if value and value not in ("Unknown", "N/A", ""):
-                card = self._make_info_card(icon_label, value)
-                self._entry_inner.addWidget(card)
-                self._fade_in(card, delay)     # ← staggered fade-in
-                delay += 60
+            # Skip blank, Unknown, and bare N/A values
+            if not value:
+                continue
+            cleaned = value.strip()
+            if cleaned.lower() in ("unknown", "n/a", ""):
+                continue
+            # For conservation on non-living objects, skip entirely
+            if "CONSERVATION" in icon_label and is_object:
+                continue
+            card = self._make_info_card(icon_label, cleaned)
+            self._entry_inner.addWidget(card)
+            self._fade_in(card, delay)
+            delay += 60
 
         alts = result.get("alternatives", [])
         if alts:
