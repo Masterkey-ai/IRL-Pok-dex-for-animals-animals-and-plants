@@ -8,6 +8,11 @@ import os
 import json
 import datetime
 import threading
+import subprocess
+import struct
+import wave
+import tempfile
+import math
 import urllib.request
 import urllib.parse
 import numpy as np
@@ -20,7 +25,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QScrollArea, QFrame, QTextEdit, QLineEdit,
     QSplitter, QStackedWidget, QGraphicsOpacityEffect, QComboBox,
-    QMenu, QGraphicsDropShadowEffect
+    QMenu, QGraphicsDropShadowEffect, QProgressBar
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation,
@@ -36,7 +41,6 @@ from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, decode_predi
 from tensorflow.keras.preprocessing import image as keras_image
 from openai import OpenAI
 
-# PyTorch — custom NC wildlife model
 import torch
 import torch.nn.functional as F
 from torchvision import transforms, models as torch_models
@@ -44,203 +48,171 @@ from PIL import Image as PILImage
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 COLLECTION_FILE   = Path.home() / ".naturedex_collection.json"
 ACHIEVEMENTS_FILE = Path.home() / ".naturedex_achievements.json"
 CORRECTIONS_FILE  = Path.home() / ".naturedex_corrections.json"
 
-# Custom NC model — sits in models/ folder next to naturedex.py
-_SCRIPT_DIR      = Path(__file__).parent
-CUSTOM_MODEL_PTH = _SCRIPT_DIR / "models" / "naturedex_nc_v1.pth"
-CUSTOM_MODEL_THRESHOLD = 60.0   # % — use custom model if confidence above this
+_SCRIPT_DIR           = Path(__file__).parent
+CUSTOM_MODEL_PTH      = _SCRIPT_DIR / "models" / "naturedex_nc_v1.pth"
+CUSTOM_MODEL_THRESHOLD = 60.0
 
-# ── The Ranger's Field Guide Color Palette ───────────────────────────────────
-# 60% Base: Deep desaturated forest — organic, not pitch black
-# 30% Structure: Dark forest/charcoal for cards and nav containers
-# 10% Accent: Sunset orange for all action items, badges, active states
-C_BG         = "#1a1f14"       # 60% — deep forest floor
-C_PANEL      = "#222918"       # 60% — slightly lifted, warmer forest panel
-C_CARD       = "#2a3320"       # 30% — dark moss card background
-C_BORDER     = "#3a4a2a"       # structural border, used very sparingly
-
-C_ACCENT     = "#e8720c"       # 10% — sunset orange, all interactive/action elements
-C_ACCENT_DIM = "#c45e08"       # dimmer orange for hover states
-
-C_TEXT       = "#f0ead8"       # cream/canvas — warm, readable on dark green
-C_SUBTEXT    = "#7a9060"       # muted sage for secondary labels
-
-# Semantic
-C_GREEN      = "#6abf5e"       # earthy green — common species, success
-C_YELLOW     = "#d4a017"       # warm amber — uncommon
-C_RED        = "#c0392b"       # deep red — rare/errors
-C_PURPLE     = "#8e5fb5"       # forest violet — very rare / legendary
-C_GOLD       = "#e8a020"       # warm gold — achievements
-C_PINK       = "#c45e8a"       # muted rose — fun facts
-
+C_BG         = "#1a1f14"
+C_PANEL      = "#222918"
+C_CARD       = "#2a3320"
+C_BORDER     = "#3a4a2a"
+C_ACCENT     = "#e8720c"
+C_ACCENT_DIM = "#c45e08"
+C_TEXT       = "#f0ead8"
+C_SUBTEXT    = "#7a9060"
+C_GREEN      = "#6abf5e"
+C_YELLOW     = "#d4a017"
+C_RED        = "#c0392b"
+C_PURPLE     = "#8e5fb5"
+C_GOLD       = "#e8a020"
+C_PINK       = "#c45e8a"
 C_ACCENT2    = C_ACCENT_DIM
-C_SCREEN     = "#0f1409"       # camera area — darkest forest
+C_SCREEN     = "#0f1409"
 C_SCAN_LINE  = C_ACCENT
 
-GROQ_MODEL   = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# ─── Achievement Definitions ──────────────────────────────────────────────────
-# Each badge is checked after every scan. "type" determines how it's evaluated:
-#   "count"    -> unlocked when len(collection) >= threshold
-#   "category" -> unlocked when number of UNIQUE categories seen >= threshold
 ACHIEVEMENTS = [
-    {"id": "first_scan",   "type": "count",    "threshold": 1,  "icon": "🔍", "name": "First Discovery",     "desc": "Scan your first object"},
-    {"id": "count_5",      "type": "count",    "threshold": 5,  "icon": "🌱", "name": "Budding Naturalist",  "desc": "Discover 5 species"},
-    {"id": "count_10",     "type": "count",    "threshold": 10, "icon": "🌿", "name": "Field Explorer",      "desc": "Discover 10 species"},
-    {"id": "count_25",     "type": "count",    "threshold": 25, "icon": "🌳", "name": "Wildlife Tracker",    "desc": "Discover 25 species"},
-    {"id": "count_50",     "type": "count",    "threshold": 50, "icon": "🏆", "name": "Master Naturalist",   "desc": "Discover 50 species"},
-    {"id": "cats_3",       "type": "category", "threshold": 3,  "icon": "🎯", "name": "Well-Rounded",        "desc": "Discover 3 different categories"},
-    {"id": "cats_5",       "type": "category", "threshold": 5,  "icon": "🧭", "name": "Diverse Explorer",    "desc": "Discover 5 different categories"},
-    {"id": "cats_7",       "type": "category", "threshold": 7,  "icon": "🌍", "name": "Renaissance Scout",   "desc": "Discover 7 different categories"},
+    {"id": "first_scan",  "type": "count",    "threshold": 1,  "icon": "🔍", "name": "First Discovery",    "desc": "Scan your first object"},
+    {"id": "count_5",     "type": "count",    "threshold": 5,  "icon": "🌱", "name": "Budding Naturalist", "desc": "Discover 5 species"},
+    {"id": "count_10",    "type": "count",    "threshold": 10, "icon": "🌿", "name": "Field Explorer",     "desc": "Discover 10 species"},
+    {"id": "count_25",    "type": "count",    "threshold": 25, "icon": "🌳", "name": "Wildlife Tracker",   "desc": "Discover 25 species"},
+    {"id": "count_50",    "type": "count",    "threshold": 50, "icon": "🏆", "name": "Master Naturalist",  "desc": "Discover 50 species"},
+    {"id": "cats_3",      "type": "category", "threshold": 3,  "icon": "🎯", "name": "Well-Rounded",       "desc": "Discover 3 different categories"},
+    {"id": "cats_5",      "type": "category", "threshold": 5,  "icon": "🧭", "name": "Diverse Explorer",   "desc": "Discover 5 different categories"},
+    {"id": "cats_7",      "type": "category", "threshold": 7,  "icon": "🌍", "name": "Renaissance Scout",  "desc": "Discover 7 different categories"},
 ]
+
+NC_PLACE_ID = 51
+
+# ─── Sound Helpers ────────────────────────────────────────────────────────────
+# Generates WAV files using stdlib only, plays via macOS afplay.
+# No extra pip installs needed.
+
+def _write_wav(freqs, duration, volume=0.22, sample_rate=44100) -> str:
+    """Generate a chord WAV and return its temp file path."""
+    n = int(sample_rate * duration)
+    fade = int(sample_rate * 0.04)
+    buf = []
+    for i in range(n):
+        v = sum(math.sin(2 * math.pi * f * i / sample_rate) for f in freqs)
+        v = v / len(freqs) * volume
+        if i < fade:       v *= i / fade
+        elif i > n - fade: v *= (n - i) / fade
+        buf.append(max(-32767, min(32767, int(v * 32767))))
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "w") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f"<{n}h", *buf))
+    return tmp.name
+
+# Pre-generate once at startup
+_WAV_SCAN    = _write_wav([880], 0.08, 0.28)           # short beep
+_WAV_SUCCESS = _write_wav([523, 659, 784], 0.35, 0.20)  # C-E-G chord
+_WAV_BOOT    = _write_wav([261, 329, 392, 523], 0.55, 0.16)  # warm chord
+
+def _play(path: str):
+    """Play a WAV file non-blocking via afplay (macOS built-in)."""
+    try:
+        subprocess.Popen(["afplay", path],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # silently skip if afplay not available
 
 # ─── iNaturalist API Lookup ───────────────────────────────────────────────────
 
-# North Carolina's iNaturalist place ID — used to get NC-specific observation counts
-NC_PLACE_ID = 51
-
 def inat_lookup(label: str) -> dict:
-    """Query the iNaturalist taxa API with a label from MobileNetV2 and return
-    enriched species data: scientific name, conservation status, NC observation
-    count, taxon rank, iconic taxon, and Wikipedia summary if available.
-
-    Returns an empty dict on any error so callers can always safely use .get().
-    This function is intentionally synchronous — it runs inside AnalysisWorker's
-    thread so it never blocks the UI.
-    """
     try:
-        # ── Step 1: taxa search by name ───────────────────────────────────────
         params = urllib.parse.urlencode({
-            "q": label,
-            "per_page": 1,
-            "rank": "species,genus,family",   # skip kingdom/class level hits
-            "is_active": "true",
+            "q": label, "per_page": 1,
+            "rank": "species,genus,family", "is_active": "true",
         })
-        url = f"https://api.inaturalist.org/v1/taxa?{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "NatureDexAI/1.0"})
-
+        req = urllib.request.Request(
+            f"https://api.inaturalist.org/v1/taxa?{params}",
+            headers={"User-Agent": "NatureDexAI/1.0"})
         with urllib.request.urlopen(req, timeout=6) as resp:
             data = json.loads(resp.read().decode())
-
         results = data.get("results", [])
         if not results:
             return {}
-
-        taxon = results[0]
-        taxon_id = taxon.get("id")
-
-        # Pull the fields we care about
+        taxon = results[0]; taxon_id = taxon.get("id")
         inat_data = {
-            "taxon_id":            taxon_id,
-            "scientific_name":     taxon.get("name", ""),
-            "common_name":         taxon.get("preferred_common_name", ""),
-            "rank":                taxon.get("rank", ""),
-            "iconic_taxon":        taxon.get("iconic_taxon_name", ""),   # Bird, Reptilia, Plantae etc.
-            "conservation_status": _parse_conservation(taxon),
-            "wikipedia_summary":   taxon.get("wikipedia_summary", ""),
-            "observations_count":  taxon.get("observations_count", 0),
+            "taxon_id":           taxon_id,
+            "scientific_name":    taxon.get("name", ""),
+            "common_name":        taxon.get("preferred_common_name", ""),
+            "rank":               taxon.get("rank", ""),
+            "iconic_taxon":       taxon.get("iconic_taxon_name", ""),
+            "conservation_status":_parse_conservation(taxon),
+            "wikipedia_summary":  taxon.get("wikipedia_summary", ""),
+            "observations_count": taxon.get("observations_count", 0),
         }
-
-        # ── Step 2: NC observation count for rarity context ───────────────────
         if taxon_id:
             inat_data["nc_observations"] = _get_nc_count(taxon_id)
-
         return inat_data
-
     except Exception as e:
-        # Network down, timeout, bad JSON — degrade silently
         print(f"[iNat lookup] {e}")
         return {}
 
-
 def _parse_conservation(taxon: dict) -> str:
-    """Extract a human-readable conservation status from the taxon dict.
-    iNaturalist nests this in conservation_status.status_name or as a
-    direct iucn_status_name field depending on API version."""
-    # Try nested conservation_status object first (v1 API)
     cs = taxon.get("conservation_status", {})
     if isinstance(cs, dict):
         name = cs.get("status_name", "")
         if name:
             return name.replace("_", " ").title()
-
-    # Fallback: top-level field present in some responses
     iucn = taxon.get("iucn_status_name", "")
     if iucn:
         return iucn.replace("_", " ").title()
-
-    return ""   # Unknown — let Groq fill this in
-
+    return ""
 
 def _get_nc_count(taxon_id: int) -> int:
-    """Return the number of research-grade iNaturalist observations of this
-    taxon in North Carolina. Used for rarity scoring later."""
     try:
         params = urllib.parse.urlencode({
-            "taxon_id": taxon_id,
-            "place_id": NC_PLACE_ID,
-            "quality_grade": "research",
-            "per_page": 0,   # we only need total_results, not actual records
+            "taxon_id": taxon_id, "place_id": NC_PLACE_ID,
+            "quality_grade": "research", "per_page": 0,
         })
-        url = f"https://api.inaturalist.org/v1/observations?{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "NatureDexAI/1.0"})
+        req = urllib.request.Request(
+            f"https://api.inaturalist.org/v1/observations?{params}",
+            headers={"User-Agent": "NatureDexAI/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-        return data.get("total_results", 0)
+            return json.loads(resp.read().decode()).get("total_results", 0)
     except Exception:
         return 0
 
-
 def _nc_rarity_label(nc_count: int) -> str:
-    """Convert a raw NC observation count to a human-readable rarity label.
-    Thresholds are rough but reasonable for NC wildlife; tune later with real data."""
-    if nc_count == 0:
-        return "Not Recorded in NC"
-    elif nc_count < 10:
-        return "Very Rare in NC"
-    elif nc_count < 100:
-        return "Rare in NC"
-    elif nc_count < 1000:
-        return "Uncommon in NC"
-    elif nc_count < 10000:
-        return "Common in NC"
-    else:
-        return "Very Common in NC"
-
+    if nc_count == 0:      return "Not Recorded in NC"
+    elif nc_count < 10:    return "Very Rare in NC"
+    elif nc_count < 100:   return "Rare in NC"
+    elif nc_count < 1000:  return "Uncommon in NC"
+    elif nc_count < 10000: return "Common in NC"
+    else:                  return "Very Common in NC"
 
 # ─── Custom NC Model ──────────────────────────────────────────────────────────
 
-# Image transform matching what train_model.py used for validation
 _custom_transform = transforms.Compose([
     transforms.Resize(int(224 * 1.1)),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 def load_custom_model():
-    """Load the trained EfficientNetV2-S NC wildlife model.
-    Returns (model, label_map, device) or (None, None, None) if not found."""
     if not CUSTOM_MODEL_PTH.exists():
         print(f"[Custom model] Not found at {CUSTOM_MODEL_PTH} — using MobileNetV2 only")
         return None, None, None
-
     label_map_path = CUSTOM_MODEL_PTH.parent / "label_map.json"
     if not label_map_path.exists():
         print("[Custom model] label_map.json missing — skipping")
         return None, None, None
-
     try:
-        device = torch.device("cpu")   # Mac inference runs on CPU
-
+        device = torch.device("cpu")
         checkpoint = torch.load(CUSTOM_MODEL_PTH, map_location=device, weights_only=False)
         num_classes = checkpoint["num_classes"]
-
         model = torch_models.efficientnet_v2_s(weights=None)
         import torch.nn as nn
         in_features = model.classifier[1].in_features
@@ -249,55 +221,38 @@ def load_custom_model():
             nn.Linear(in_features, num_classes),
         )
         model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        model.to(device)
-
+        model.eval().to(device)
         with open(label_map_path) as f:
             label_map = json.load(f)
-
         print(f"[Custom model] Loaded — {num_classes} NC species, "
-              f"val acc {checkpoint.get('val_accuracy', '?'):.1f}%")
+              f"val acc {checkpoint.get('val_accuracy', 0):.1f}%")
         return model, label_map, device
-
     except Exception as e:
         print(f"[Custom model] Failed to load: {e}")
         return None, None, None
 
-
 @torch.no_grad()
 def run_custom_model(model, label_map, device, image_path: str):
-    """Run the custom model on an image. Returns (label, confidence, alternatives)
-    or None if model is unavailable."""
     if model is None:
         return None
-
     try:
         img = PILImage.open(image_path).convert("RGB")
         tensor = _custom_transform(img).unsqueeze(0).to(device)
-        logits = model(tensor)
-        probs  = F.softmax(logits, dim=1)[0]
-
+        probs = F.softmax(model(tensor), dim=1)[0]
         top5_probs, top5_idx = torch.topk(probs, min(5, len(label_map)))
-
-        top_idx   = top5_idx[0].item()
-        top_prob  = top5_probs[0].item() * 100
-        top_info  = label_map.get(str(top_idx), {})
+        top_idx  = top5_idx[0].item()
+        top_prob = top5_probs[0].item() * 100
+        top_info = label_map.get(str(top_idx), {})
         top_label = top_info.get("common_name", f"Species {top_idx}")
-
-        alternatives = []
-        for prob, idx in zip(top5_probs[1:4], top5_idx[1:4]):
-            info = label_map.get(str(idx.item()), {})
-            alternatives.append({
-                "name":       info.get("common_name", f"Species {idx.item()}"),
-                "confidence": prob.item() * 100,
-            })
-
+        alternatives = [
+            {"name": label_map.get(str(idx.item()), {}).get("common_name", f"Species {idx.item()}"),
+             "confidence": prob.item() * 100}
+            for prob, idx in zip(top5_probs[1:4], top5_idx[1:4])
+        ]
         return top_label, top_prob, alternatives, top_info
-
     except Exception as e:
         print(f"[Custom model] Inference error: {e}")
         return None
-
 
 # ─── Worker Threads ────────────────────────────────────────────────────────────
 
@@ -315,7 +270,7 @@ class CameraThread(QThread):
             ret, frame = self.cap.read()
             if ret:
                 self.frame_ready.emit(frame)
-            self.msleep(33)  # ~30fps
+            self.msleep(33)
 
     def stop(self):
         self._running = False
@@ -331,13 +286,14 @@ class CameraThread(QThread):
 
 
 class AnalysisWorker(QThread):
-    result_ready = pyqtSignal(dict)
+    result_ready   = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, frame, model, client, custom_model=None, custom_label_map=None, custom_device=None):
+    def __init__(self, frame, model, client,
+                 custom_model=None, custom_label_map=None, custom_device=None):
         super().__init__()
         self.frame            = frame
-        self.model            = model        # MobileNetV2 (TensorFlow fallback)
+        self.model            = model
         self.client           = client
         self.custom_model     = custom_model
         self.custom_label_map = custom_label_map
@@ -345,85 +301,69 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            # Save frame
             tmp_path = "/tmp/naturedex_scan.jpg"
             cv2.imwrite(tmp_path, self.frame)
 
-            # ── Step 1: Try custom NC model first ────────────────────────────
-            used_custom = False
+            used_custom   = False
             custom_result = run_custom_model(
                 self.custom_model, self.custom_label_map,
-                self.custom_device, tmp_path
-            )
+                self.custom_device, tmp_path)
 
             if custom_result and custom_result[1] >= CUSTOM_MODEL_THRESHOLD:
-                # Custom model is confident — use it
                 label, confidence, alternatives, top_info = custom_result
-                raw_label = label.lower().replace(" ", "_")
-                used_custom = True
+                raw_label    = label.lower().replace(" ", "_")
+                used_custom  = True
                 model_source = "NatureDex NC Model (89% accuracy)"
             else:
-                # ── Step 1b: Fall back to MobileNetV2 ────────────────────────
                 img = keras_image.load_img(tmp_path, target_size=(224, 224))
-                arr = keras_image.img_to_array(img)
-                arr = np.expand_dims(arr, axis=0)
-                arr = preprocess_input(arr)
-                preds = self.model.predict(arr, verbose=0)
-                decoded = decode_predictions(preds, top=5)[0]
-
-                top = decoded[0]
-                label       = top[1].replace("_", " ").title()
-                confidence  = top[2] * 100
-                raw_label   = top[1]
+                arr = preprocess_input(
+                    np.expand_dims(keras_image.img_to_array(img), 0))
+                decoded = decode_predictions(
+                    self.model.predict(arr, verbose=0), top=5)[0]
+                top          = decoded[0]
+                label        = top[1].replace("_", " ").title()
+                confidence   = top[2] * 100
+                raw_label    = top[1]
                 alternatives = [
-                    {"name": d[1].replace("_", " ").title(), "confidence": d[2] * 100}
+                    {"name": d[1].replace("_", " ").title(),
+                     "confidence": d[2] * 100}
                     for d in decoded[1:4]
                 ]
                 model_source = "MobileNetV2 (ImageNet)"
-
-                # If custom model ran but wasn't confident, still note its top guess
+                top_info     = {}
                 if custom_result:
-                    print(f"[Model] Custom model low confidence ({custom_result[1]:.1f}%) "
-                          f"— using MobileNetV2 fallback")
+                    print(f"[Model] Custom low conf ({custom_result[1]:.1f}%) "
+                          f"— using MobileNetV2")
 
-            # ── Step 2: iNaturalist lookup ────────────────────────────────────
             inat_data = inat_lookup(label)
-
-            # If custom model ran, use its taxon_id for more accurate iNat lookup
             if used_custom and top_info.get("taxon_id"):
-                inat_data["taxon_id"]    = top_info["taxon_id"]
+                inat_data["taxon_id"]     = top_info["taxon_id"]
                 inat_data["iconic_taxon"] = top_info.get("iconic_group", "")
                 if not inat_data.get("nc_observations"):
                     inat_data["nc_observations"] = _get_nc_count(top_info["taxon_id"])
 
-            # ── Step 3: Groq entry generation ────────────────────────────────
-            entry = self._generate_entry(label, confidence, inat_data)
-
+            entry    = self._generate_entry(label, confidence, inat_data)
             nc_count = inat_data.get("nc_observations", 0)
             rarity   = _nc_rarity_label(nc_count)
 
-            result = {
-                "name":           inat_data.get("common_name") or label,
-                "raw_label":      raw_label,
-                "confidence":     confidence,
-                "alternatives":   alternatives,
-                "entry":          entry,
-                "inat":           inat_data,
-                "rarity":         rarity,
-                "nc_observations":nc_count,
-                "model_source":   model_source,
+            self.result_ready.emit({
+                "name":              inat_data.get("common_name") or label,
+                "raw_label":         raw_label,
+                "confidence":        confidence,
+                "alternatives":      alternatives,
+                "entry":             entry,
+                "inat":              inat_data,
+                "rarity":            rarity,
+                "nc_observations":   nc_count,
+                "model_source":      model_source,
                 "used_custom_model": used_custom,
-                "timestamp":      datetime.datetime.now().isoformat(),
-                "image_path":     tmp_path,
-            }
-            self.result_ready.emit(result)
-
+                "timestamp":         datetime.datetime.now().isoformat(),
+                "image_path":        tmp_path,
+            })
         except Exception as e:
             self.error_occurred.emit(str(e))
 
     def _generate_entry(self, label: str, confidence: float, inat_data: dict) -> dict:
-        # Build a context block from iNaturalist data so Groq uses real facts
-        # rather than hallucinating conservation status, scientific names, etc.
         inat_context = ""
         if inat_data:
             lines = []
@@ -442,11 +382,11 @@ class AnalysisWorker(QThread):
             if inat_data.get("nc_observations") is not None:
                 lines.append(f"North Carolina observations: {inat_data['nc_observations']:,}")
             if inat_data.get("wikipedia_summary"):
-                # Trim long summaries — we just need enough for factual grounding
-                summary = inat_data["wikipedia_summary"][:600]
-                lines.append(f"Wikipedia summary: {summary}")
+                lines.append(f"Wikipedia summary: {inat_data['wikipedia_summary'][:600]}")
             if lines:
-                inat_context = "\n\nVerified data from iNaturalist (use this — do NOT contradict it):\n" + "\n".join(lines)
+                inat_context = (
+                    "\n\nVerified data from iNaturalist "
+                    "(use this — do NOT contradict it):\n" + "\n".join(lines))
 
         prompt = f"""You are NatureDex AI, an educational wildlife identification system.
 A user has scanned an object identified as: {label} (confidence: {confidence:.1f}%){inat_context}
@@ -454,10 +394,9 @@ A user has scanned an object identified as: {label} (confidence: {confidence:.1f
 Generate a structured NatureDex entry. You MUST respond with ONLY valid JSON — no markdown, no code fences, no explanation.
 
 IMPORTANT rules:
-- Use the verified iNaturalist data above where provided — do NOT invent a different scientific name or conservation status
-- If conservation_status is provided above, use it exactly
-- If scientific_name is provided above, use it exactly
-- For north_carolina_context, use the NC observation count above to describe how common it is in NC
+- Use the verified iNaturalist data above where provided
+- Do NOT invent a different scientific name or conservation status
+- For north_carolina_context, use the NC observation count above
 
 The JSON must have exactly these keys:
 {{
@@ -477,64 +416,46 @@ The JSON must have exactly these keys:
 If this is a non-living object, adapt the fields creatively in Pokédex style.
 Return ONLY the JSON object. No other text."""
 
-        response = self.client.chat.completions.create(
+        raw = self.client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=1024,   # raised from 800 — truncation was causing JSON parse failures
-        )
-        raw = response.choices[0].message.content.strip()
+            max_tokens=1024,
+        ).choices[0].message.content.strip()
 
-        # Strategy: try increasingly aggressive extraction methods so we
-        # never fall through to displaying raw text in the UI.
-
-        # 1. Strip markdown code fences if present
         if "```" in raw:
-            parts = raw.split("```")
-            for part in parts:
+            for part in raw.split("```"):
                 part = part.strip()
                 if part.startswith("json"):
                     part = part[4:].strip()
                 if part.startswith("{"):
-                    raw = part
-                    break
+                    raw = part; break
 
-        # 2. If there's preamble text before the JSON, slice from first { to last }
         if not raw.startswith("{"):
-            start = raw.find("{")
-            end   = raw.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                raw = raw[start:end + 1]
+            s, e = raw.find("{"), raw.rfind("}")
+            if s != -1 and e > s:
+                raw = raw[s:e + 1]
 
         raw = raw.strip()
-
-        # 3. If JSON was token-truncated mid-response, it won't have a closing }.
-        #    Try to close it so json.loads has a chance.
         if raw.startswith("{") and not raw.endswith("}"):
-            # Close any open string (remove trailing partial value)
-            last_quote = raw.rfind('"')
-            last_comma = raw.rfind(",")
-            # Trim back to the last complete key-value pair
-            cut = max(last_comma, 0)
+            cut = max(raw.rfind(","), 0)
             raw = raw[:cut].rstrip().rstrip(",") + "\n}"
 
         try:
             return json.loads(raw)
         except Exception:
-            # Genuine parse failure — return a clean fallback with whatever
-            # iNat data we have so at least the header renders correctly
             return {
-                "common_name": inat_data.get("common_name") or label,
-                "scientific_name": inat_data.get("scientific_name") or "Unknown",
-                "category": inat_data.get("iconic_taxon") or "Unknown",
-                "type_tags": [],
-                "habitat": "Unknown",
-                "diet": "Unknown",
-                "behavior": "Unknown",
-                "conservation_status": inat_data.get("conservation_status") or "N/A",
-                "north_carolina_context": "Unknown",
-                "fun_fact": "Analysis unavailable.",
-                "description": "Entry generation failed — try scanning again.",
+                "common_name":           inat_data.get("common_name") or label,
+                "scientific_name":       inat_data.get("scientific_name") or "Unknown",
+                "category":              inat_data.get("iconic_taxon") or "Unknown",
+                "type_tags":             [],
+                "habitat":               "Unknown",
+                "diet":                  "Unknown",
+                "behavior":              "Unknown",
+                "conservation_status":   inat_data.get("conservation_status") or "N/A",
+                "north_carolina_context":"Unknown",
+                "fun_fact":              "Analysis unavailable.",
+                "description":           "Entry generation failed — try scanning again.",
             }
 
 
@@ -543,20 +464,150 @@ class ChatWorker(QThread):
 
     def __init__(self, client, messages):
         super().__init__()
-        self.client = client
+        self.client   = client
         self.messages = messages
 
     def run(self):
         try:
-            response = self.client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=self.messages,
-                temperature=0.7,
-                max_tokens=400,
+            self.reply_ready.emit(
+                self.client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=self.messages,
+                    temperature=0.7,
+                    max_tokens=400,
+                ).choices[0].message.content.strip()
             )
-            self.reply_ready.emit(response.choices[0].message.content.strip())
         except Exception as e:
             self.reply_ready.emit(f"Error: {str(e)}")
+
+
+# ─── Boot Screen ──────────────────────────────────────────────────────────────
+
+class BootScreen(QWidget):
+    """Full-screen splash shown while models load, then fades out."""
+    boot_complete = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"background: {C_BG};")
+        self._progress = 0.0
+        self._ready    = False
+        self._dc       = 0
+
+        outer = QVBoxLayout(self)
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.setSpacing(0)
+
+        # Icon
+        icon = QLabel("🌿")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet("font-size: 72px; background: transparent;")
+        outer.addWidget(icon)
+        outer.addSpacing(16)
+
+        # App name
+        name = QLabel("NatureDex")
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name.setStyleSheet(
+            f"color:{C_TEXT};font-size:48px;font-weight:900;"
+            f"letter-spacing:4px;background:transparent;")
+        outer.addWidget(name)
+        outer.addSpacing(8)
+
+        # Tagline
+        tag = QLabel("AI Wildlife Identification")
+        tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tag.setStyleSheet(
+            f"color:{C_ACCENT};font-size:14px;font-weight:600;"
+            f"letter-spacing:3px;background:transparent;")
+        outer.addWidget(tag)
+        outer.addSpacing(56)
+
+        # Progress container
+        prog_wrap = QWidget()
+        prog_wrap.setFixedWidth(320)
+        prog_wrap.setStyleSheet("background:transparent;")
+        pw_layout = QVBoxLayout(prog_wrap)
+        pw_layout.setSpacing(10)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setFixedHeight(4)
+        self._bar.setTextVisible(False)
+        self._bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: {C_CARD};
+                border-radius: 2px;
+                border: none;
+            }}
+            QProgressBar::chunk {{
+                background: {C_ACCENT};
+                border-radius: 2px;
+            }}
+        """)
+        pw_layout.addWidget(self._bar)
+
+        self._status = QLabel("Initializing...")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setStyleSheet(
+            f"color:{C_SUBTEXT};font-size:11px;background:transparent;")
+        pw_layout.addWidget(self._status)
+        outer.addWidget(prog_wrap, alignment=Qt.AlignmentFlag.AlignCenter)
+        outer.addSpacing(40)
+
+        # Credit
+        credit = QLabel("Congressional App Challenge  ·  Tejo Mukkamala")
+        credit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        credit.setStyleSheet(f"color:{C_BORDER};font-size:10px;background:transparent;")
+        outer.addWidget(credit)
+
+        # Tick timer
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(55)
+
+        # Play boot sound after short delay
+        QTimer.singleShot(300, lambda: _play(_WAV_BOOT))
+
+    def mark_ready(self):
+        """Called from model-load thread (via signal) when loading is done."""
+        self._ready = True
+
+    def _tick(self):
+        if self._ready:
+            self._bar.setValue(100)
+            self._status.setText("Ready!")
+            self._timer.stop()
+            QTimer.singleShot(500, self._finish)
+            return
+
+        # Simulate progress that slows near 90%
+        if   self._progress < 30:  self._progress += 2.8
+        elif self._progress < 65:  self._progress += 1.1
+        elif self._progress < 88:  self._progress += 0.3
+
+        self._bar.setValue(int(self._progress))
+        self._dc = (self._dc + 1) % 4
+        dots = "." * self._dc
+        if   self._progress < 35: msg = f"Loading vision models{dots}"
+        elif self._progress < 65: msg = f"Loading NC wildlife model{dots}"
+        else:                      msg = f"Preparing AI systems{dots}"
+        self._status.setText(msg)
+
+    def _finish(self):
+        """Fade the boot screen out, then signal completion."""
+        eff  = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity")
+        anim.setDuration(500)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(self.boot_complete.emit)
+        anim.start()
+        self._anim = anim  # keep alive
 
 
 # ─── UI Components ─────────────────────────────────────────────────────────────
@@ -566,9 +617,9 @@ class ScanButton(QPushButton):
         super().__init__(parent)
         self.setText("⬤  SCAN")
         self.setFixedSize(160, 52)
-        self._scanning = False
+        self._scanning  = False
         self._dot_count = 0
-        self._timer = QTimer(self)
+        self._timer     = QTimer(self)
         self._timer.timeout.connect(self._pulse)
         self.setStyleSheet(self._normal_style())
 
@@ -601,7 +652,7 @@ class ScanButton(QPushButton):
         """
 
     def start_scanning(self):
-        self._scanning = True
+        self._scanning  = True
         self._dot_count = 0
         self.setEnabled(False)
         self.setStyleSheet(self._scanning_style())
@@ -621,21 +672,19 @@ class ScanButton(QPushButton):
 
 
 class ScanOverlay(QWidget):
-    """Animated scan line overlay drawn on top of camera feed."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._active = False
-        self._y = 0
-        self._timer = QTimer(self)
+        self._y      = 0
+        self._timer  = QTimer(self)
         self._timer.timeout.connect(self._update)
         self._corner_flash = 0
 
     def start(self):
         self._active = True
-        self._y = 0
+        self._y      = 0
         self._corner_flash = 0
         self._timer.start(16)
         self.show()
@@ -657,28 +706,23 @@ class ScanOverlay(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Subtle dark vignette
         painter.fillRect(0, 0, w, h, QColor(0, 0, 0, 40))
 
-        # Sunset orange scan line
         grad = QLinearGradient(0, self._y - 20, 0, self._y + 20)
         grad.setColorAt(0.0, QColor(232, 114, 12, 0))
         grad.setColorAt(0.5, QColor(232, 114, 12, 160))
         grad.setColorAt(1.0, QColor(232, 114, 12, 0))
         painter.fillRect(0, self._y - 20, w, 40, grad)
 
-        # Orange corner brackets
         pen = QPen(QColor(C_ACCENT), 3)
         painter.setPen(pen)
-        corner = 26
-        gap = 16
+        corner, gap = 26, 16
         for x, y in [(gap, gap), (w - gap, gap), (gap, h - gap), (w - gap, h - gap)]:
             dx = corner if x == gap else -corner
             dy = corner if y == gap else -corner
             painter.drawLine(x, y, x + dx, y)
             painter.drawLine(x, y, x, y + dy)
 
-        # Center crosshair
         cx, cy = w // 2, h // 2
         pen2 = QPen(QColor(232, 114, 12, 80), 1)
         pen2.setStyle(Qt.PenStyle.DotLine)
@@ -689,8 +733,6 @@ class ScanOverlay(QWidget):
 
 
 class ToastNotification(QFrame):
-    """A small auto-dismissing popup used to announce unlocked achievements."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"""
@@ -718,9 +760,11 @@ class ToastNotification(QFrame):
         text_box = QVBoxLayout()
         text_box.setSpacing(1)
         header = QLabel("ACHIEVEMENT UNLOCKED")
-        header.setStyleSheet(f"color: {C_GOLD}; font-size: 9px; font-weight: 800; letter-spacing: 1.5px;")
+        header.setStyleSheet(
+            f"color: {C_GOLD}; font-size: 9px; font-weight: 800; letter-spacing: 1.5px;")
         self._name_lbl = QLabel("")
-        self._name_lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 13px; font-weight: 700;")
+        self._name_lbl.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 13px; font-weight: 700;")
         text_box.addWidget(header)
         text_box.addWidget(self._name_lbl)
         layout.addLayout(text_box)
@@ -731,30 +775,24 @@ class ToastNotification(QFrame):
 
         self._dismiss_timer = QTimer(self)
         self._dismiss_timer.setSingleShot(True)
-        self._dismiss_timer.timeout.connect(self._fade_out)
-
-        self._opacity_effect = None
+        self._dismiss_timer.timeout.connect(self.hide)
 
     def show_achievement(self, icon, name):
         self._icon_lbl.setText(icon)
         self._name_lbl.setText(name)
-        self.setWindowOpacity(1.0)
         self.show()
         self.raise_()
         self._dismiss_timer.start(3000)
 
-    def _fade_out(self):
-        self.hide()
-
 
 class CollectionCard(QFrame):
     clicked_signal = pyqtSignal(dict)
-    delete_signal = pyqtSignal(str)  # emits the entry's timestamp (used as unique id)
+    delete_signal  = pyqtSignal(str)
 
     def __init__(self, entry_data, parent=None):
         super().__init__(parent)
-        self.entry_data = entry_data
-        self._category = entry_data.get("entry", {}).get("category", "Unknown") or "Unknown"
+        self.entry_data   = entry_data
+        self._category    = entry_data.get("entry", {}).get("category", "Unknown") or "Unknown"
         self._search_text = (
             entry_data.get("name", "") + " " +
             entry_data.get("entry", {}).get("common_name", "") + " " +
@@ -779,21 +817,19 @@ class CollectionCard(QFrame):
         layout.setContentsMargins(10, 6, 6, 6)
         layout.setSpacing(10)
 
-        # Confidence indicator dot
-        conf = entry_data.get("confidence", 0)
+        conf      = entry_data.get("confidence", 0)
         dot_color = C_GREEN if conf >= 75 else C_YELLOW if conf >= 50 else C_RED
         dot = QLabel("●")
         dot.setStyleSheet(f"color: {dot_color}; font-size: 10px;")
         dot.setFixedWidth(14)
         layout.addWidget(dot)
 
-        # Name + timestamp
         info = QVBoxLayout()
         info.setSpacing(1)
         name_lbl = QLabel(entry_data.get("name", "Unknown"))
-        name_lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 12px; font-weight: 600;")
-        ts = entry_data.get("timestamp", "")[:10]
-        ts_lbl = QLabel(ts)
+        name_lbl.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 12px; font-weight: 600;")
+        ts_lbl = QLabel(entry_data.get("timestamp", "")[:10])
         ts_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px;")
         info.addWidget(name_lbl)
         info.addWidget(ts_lbl)
@@ -801,10 +837,10 @@ class CollectionCard(QFrame):
         layout.addStretch()
 
         conf_lbl = QLabel(f"{conf:.0f}%")
-        conf_lbl.setStyleSheet(f"color: {dot_color}; font-size: 11px; font-weight: 700;")
+        conf_lbl.setStyleSheet(
+            f"color: {dot_color}; font-size: 11px; font-weight: 700;")
         layout.addWidget(conf_lbl)
 
-        # Delete button - hidden until hover
         self._delete_btn = QPushButton("✕")
         self._delete_btn.setFixedSize(22, 22)
         self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -838,7 +874,6 @@ class CollectionCard(QFrame):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        # Don't trigger card click if the delete button was clicked
         if self._delete_btn.geometry().contains(event.pos()):
             return
         self.clicked_signal.emit(self.entry_data)
@@ -848,56 +883,71 @@ class CollectionCard(QFrame):
 
 class NatureDexWindow(QMainWindow):
 
-    # Signal for safely updating the loading label from the background thread
-    model_status_signal = pyqtSignal(str)  # "ready" | "error: ..."
+    model_status_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NatureDex AI")
 
-        # Clamp window size to whatever screen we're actually on, so the
-        # bottom controls can never end up pushed off-screen (e.g. smaller
-        # laptop displays, scaled resolutions, or a menu bar eating space).
-        screen = QApplication.primaryScreen()
+        screen    = QApplication.primaryScreen()
         available = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
-        target_w = min(1280, available.width() - 40)
-        target_h = min(800, available.height() - 40)
-        min_w = min(1000, target_w)
-        min_h = min(640, target_h)
-        self.setMinimumSize(min_w, min_h)
+        target_w  = min(1280, available.width()  - 40)
+        target_h  = min(800,  available.height() - 40)
+        self.setMinimumSize(min(1000, target_w), min(640, target_h))
         self.resize(target_w, target_h)
         self.move(available.x() + 20, available.y() + 20)
 
-        self._collection = self._load_collection()
+        self._collection            = self._load_collection()
         self._unlocked_achievements = self._load_achievements()
-        self._current_result = None
-        self._chat_history = []
-        self._camera_thread = None
-        self._analysis_worker = None
-        self._last_frame = None
-        self._scan_overlay = None
-        self._toast = None
+        self._current_result        = None
+        self._chat_history          = []
+        self._camera_thread         = None
+        self._analysis_worker       = None
+        self._last_frame            = None
+        self._scan_overlay          = None
+        self._toast                 = None
+        self._chat_worker           = None
+        self._entry_anims           = []  # keeps fade-in animation refs alive
 
-        # Load AI models
-        self._model = None           # MobileNetV2 fallback
-        self._client = None
-        self._custom_model = None    # custom NC EfficientNetV2 model
+        self._model            = None
+        self._client           = None
+        self._custom_model     = None
         self._custom_label_map = None
-        self._custom_device = None
-        self._models_loaded = False
+        self._custom_device    = None
+        self._models_loaded    = False
 
         self._setup_style()
         self._build_ui()
-        self._start_camera()
 
-        # Wire the signal BEFORE starting the loader so it's ready to receive
+        # ── Boot screen overlay ──────────────────────────────────────────────
+        self._boot = BootScreen(self)
+        self._boot.setGeometry(self.rect())
+        self._boot.boot_complete.connect(self._on_boot_done)
+        self._boot.show()
+        self._boot.raise_()
+
+        self._start_camera()
         self.model_status_signal.connect(self._on_model_status)
         self._load_models_async()
 
-        # Toast lives on top of the whole window so it can appear regardless
-        # of which tab/panel is active
         self._toast = ToastNotification(self)
         self._toast.move(self.width() - 300, 70)
+
+    # ── Boot ───────────────────────────────────────────────────────────────────
+
+    def _on_boot_done(self):
+        self._boot.hide()
+        self._boot.deleteLater()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_boot"):
+            try:
+                self._boot.setGeometry(self.rect())
+            except RuntimeError:
+                pass
+        if self._toast:
+            self._toast.move(self.width() - 300, 70)
 
     # ── Style ──────────────────────────────────────────────────────────────────
 
@@ -946,14 +996,8 @@ class NatureDexWindow(QMainWindow):
         root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
-
-        # Left sidebar (collection)
-        sidebar = self._build_sidebar()
-        root_layout.addWidget(sidebar)
-
-        # Main area: camera + info
-        main = self._build_main()
-        root_layout.addWidget(main, stretch=1)
+        root_layout.addWidget(self._build_sidebar())
+        root_layout.addWidget(self._build_main(), stretch=1)
 
     def _build_sidebar(self):
         sidebar = QFrame()
@@ -963,7 +1007,6 @@ class NatureDexWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header — flat, no gradient, no button feel
         header = QFrame()
         header.setFixedHeight(60)
         header.setStyleSheet(f"background: {C_PANEL};")
@@ -971,43 +1014,35 @@ class NatureDexWindow(QMainWindow):
         h_layout.setContentsMargins(18, 0, 14, 0)
 
         title = QLabel("NatureDex")
-        title.setStyleSheet(f"""
-            color: {C_TEXT};
-            font-size: 20px;
-            font-weight: 800;
-            letter-spacing: 1px;
-        """)
+        title.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 20px; font-weight: 800; letter-spacing: 1px;")
         h_layout.addWidget(title)
         h_layout.addStretch()
 
-        # Trophy — plain text label, no box, no button styling
         self._badges_btn = QLabel("🏆")
         self._badges_btn.setStyleSheet(f"color: {C_GOLD}; font-size: 18px;")
         self._badges_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._badges_btn.setToolTip("Achievements")
         self._badges_btn.mousePressEvent = lambda e: self._show_badges_panel()
         h_layout.addWidget(self._badges_btn)
-
         layout.addWidget(header)
 
-        # Thin divider — one line only, no stacked borders
         divider = QFrame()
         divider.setFixedHeight(1)
         divider.setStyleSheet(f"background: {C_BORDER};")
         layout.addWidget(divider)
 
-        # Stats — inline with header feel, no separate block
         stats_frame = QFrame()
         stats_frame.setFixedHeight(36)
         stats_frame.setStyleSheet(f"background: {C_PANEL};")
         s_layout = QHBoxLayout(stats_frame)
         s_layout.setContentsMargins(18, 0, 18, 0)
         self._species_count_lbl = QLabel(f"{len(self._collection)} discovered")
-        self._species_count_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px;")
+        self._species_count_lbl.setStyleSheet(
+            f"color: {C_SUBTEXT}; font-size: 11px;")
         s_layout.addWidget(self._species_count_lbl)
         layout.addWidget(stats_frame)
 
-        # Search + filter — no box around them, just inputs floating on panel bg
         search_frame = QFrame()
         search_frame.setStyleSheet(f"background: {C_PANEL};")
         sf_layout = QVBoxLayout(search_frame)
@@ -1045,10 +1080,8 @@ class NatureDexWindow(QMainWindow):
         """)
         self._category_filter.currentTextChanged.connect(self._apply_filters)
         sf_layout.addWidget(self._category_filter)
-
         layout.addWidget(search_frame)
 
-        # Section label
         col_label = QLabel("DISCOVERIES")
         col_label.setStyleSheet(f"""
             color: {C_SUBTEXT};
@@ -1059,14 +1092,13 @@ class NatureDexWindow(QMainWindow):
         """)
         layout.addWidget(col_label)
 
-        # Empty-state label, shown when filters match nothing
         self._empty_filter_lbl = QLabel("No matches found")
         self._empty_filter_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_filter_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 12px; padding: 20px;")
+        self._empty_filter_lbl.setStyleSheet(
+            f"color: {C_SUBTEXT}; font-size: 12px; padding: 20px;")
         self._empty_filter_lbl.hide()
         layout.addWidget(self._empty_filter_lbl)
 
-        # Scroll area for collection cards
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1085,7 +1117,6 @@ class NatureDexWindow(QMainWindow):
         for entry in reversed(self._collection):
             self._add_collection_card(entry, prepend=False)
         self._refresh_category_filter_options()
-
         return sidebar
 
     def _build_main(self):
@@ -1093,15 +1124,8 @@ class NatureDexWindow(QMainWindow):
         layout = QHBoxLayout(main)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        # Camera panel
-        cam_panel = self._build_camera_panel()
-        layout.addWidget(cam_panel, stretch=5)
-
-        # Info panel
-        info_panel = self._build_info_panel()
-        layout.addWidget(info_panel, stretch=4)
-
+        layout.addWidget(self._build_camera_panel(), stretch=5)
+        layout.addWidget(self._build_info_panel(),   stretch=4)
         return main
 
     def _build_camera_panel(self):
@@ -1117,7 +1141,8 @@ class NatureDexWindow(QMainWindow):
         ch_layout = QHBoxLayout(cam_header)
         ch_layout.setContentsMargins(16, 0, 16, 0)
         cam_lbl = QLabel("● LIVE SCANNER")
-        cam_lbl.setStyleSheet(f"color: {C_ACCENT}; font-size: 11px; font-weight: 700; letter-spacing: 2px;")
+        cam_lbl.setStyleSheet(
+            f"color: {C_ACCENT}; font-size: 11px; font-weight: 700; letter-spacing: 2px;")
         self._status_lbl = QLabel("Ready")
         self._status_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px;")
         ch_layout.addWidget(cam_lbl)
@@ -1125,28 +1150,23 @@ class NatureDexWindow(QMainWindow):
         ch_layout.addWidget(self._status_lbl)
         layout.addWidget(cam_header)
 
-        # Camera feed — pure black screen
         cam_container = QFrame()
         cam_container.setStyleSheet("background: #000;")
         cam_layout = QVBoxLayout(cam_container)
         cam_layout.setContentsMargins(0, 0, 0, 0)
-
         self._camera_label = QLabel()
         self._camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._camera_label.setStyleSheet("background: #000;")
         self._camera_label.setMinimumHeight(220)
         cam_layout.addWidget(self._camera_label)
-
-        # Overlay (scan animation)
         self._scan_overlay = ScanOverlay(cam_container)
         self._scan_overlay.hide()
-
         layout.addWidget(cam_container, stretch=1)
 
-        # Controls
         controls = QFrame()
         controls.setFixedHeight(88)
-        controls.setStyleSheet(f"background: {C_PANEL}; border-top: 1px solid {C_BORDER};")
+        controls.setStyleSheet(
+            f"background: {C_PANEL}; border-top: 1px solid {C_BORDER};")
         c_layout = QHBoxLayout(controls)
         c_layout.setContentsMargins(24, 0, 24, 0)
         c_layout.setSpacing(16)
@@ -1165,9 +1185,7 @@ class NatureDexWindow(QMainWindow):
         c_layout.addWidget(hint)
         c_layout.addStretch()
         c_layout.addWidget(self._loading_lbl)
-
         layout.addWidget(controls)
-
         return panel
 
     def _build_info_panel(self):
@@ -1177,7 +1195,6 @@ class NatureDexWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Tab header
         tab_bar = QFrame()
         tab_bar.setFixedHeight(44)
         tab_bar.setStyleSheet(f"background: {C_PANEL};")
@@ -1195,12 +1212,10 @@ class NatureDexWindow(QMainWindow):
         tab_layout.addStretch()
         layout.addWidget(tab_bar)
 
-        # Stacked content
         self._tab_stack = QStackedWidget()
         self._tab_stack.addWidget(self._build_entry_tab())
         self._tab_stack.addWidget(self._build_chat_tab())
         layout.addWidget(self._tab_stack, stretch=1)
-
         return panel
 
     def _make_tab_btn(self, text, active):
@@ -1272,7 +1287,6 @@ class NatureDexWindow(QMainWindow):
         scroll.setWidget(self._entry_content)
         layout.addWidget(scroll, stretch=1)
 
-        # ── Correction bar — hidden by default, shown inline when report clicked
         self._correction_bar = QFrame()
         self._correction_bar.setFixedHeight(50)
         self._correction_bar.setStyleSheet(f"background: {C_CARD};")
@@ -1333,7 +1347,6 @@ class NatureDexWindow(QMainWindow):
         cb_cancel.clicked.connect(self._on_correction_cancel)
         self._correction_input.returnPressed.connect(self._on_correction_submit)
 
-        # ── Footer — report button always visible at bottom-right
         footer = QFrame()
         footer.setFixedHeight(40)
         footer.setStyleSheet(f"background: {C_BG};")
@@ -1360,7 +1373,6 @@ class NatureDexWindow(QMainWindow):
         f_layout.addStretch()
         f_layout.addWidget(self._report_btn)
         layout.addWidget(footer)
-
         return widget
 
     def _build_chat_tab(self):
@@ -1369,31 +1381,29 @@ class NatureDexWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Chat messages
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._chat_scroll = scroll
 
         self._chat_content = QWidget()
-        self._chat_inner = QVBoxLayout(self._chat_content)
+        self._chat_inner   = QVBoxLayout(self._chat_content)
         self._chat_inner.setContentsMargins(16, 16, 16, 8)
         self._chat_inner.setSpacing(10)
 
         intro = QLabel("Ask follow-up questions about\nyour last scan.")
         intro.setAlignment(Qt.AlignmentFlag.AlignCenter)
         intro.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px; padding: 40px 0;")
-        self._chat_intro = intro
         self._chat_inner.addWidget(intro)
         self._chat_inner.addStretch()
 
         scroll.setWidget(self._chat_content)
         layout.addWidget(scroll, stretch=1)
 
-        # Input bar
         input_bar = QFrame()
         input_bar.setFixedHeight(58)
-        input_bar.setStyleSheet(f"background: {C_PANEL}; border-top: 1px solid {C_BORDER};")
+        input_bar.setStyleSheet(
+            f"background: {C_PANEL}; border-top: 1px solid {C_BORDER};")
         i_layout = QHBoxLayout(input_bar)
         i_layout.setContentsMargins(12, 10, 12, 10)
         i_layout.setSpacing(8)
@@ -1425,14 +1435,13 @@ class NatureDexWindow(QMainWindow):
                 font-size: 14px;
                 font-weight: 700;
             }}
-            QPushButton:hover {{ background: #33ddff; }}
+            QPushButton:hover {{ background: #f08020; }}
         """)
         send_btn.clicked.connect(self._on_chat_send)
 
         i_layout.addWidget(self._chat_input)
         i_layout.addWidget(send_btn)
         layout.addWidget(input_bar)
-
         return widget
 
     # ── Camera ─────────────────────────────────────────────────────────────────
@@ -1445,19 +1454,14 @@ class NatureDexWindow(QMainWindow):
     def _on_frame(self, frame):
         self._last_frame = frame
         h, w, ch = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qt_img)
-
-        lbl_size = self._camera_label.size()
         scaled = pixmap.scaled(
-            lbl_size,
+            self._camera_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
+            Qt.TransformationMode.SmoothTransformation)
         self._camera_label.setPixmap(scaled)
-
-        # Keep overlay sized to match label widget
         if self._scan_overlay:
             self._scan_overlay.setGeometry(self._camera_label.geometry())
 
@@ -1466,28 +1470,26 @@ class NatureDexWindow(QMainWindow):
     def _load_models_async(self):
         def _load():
             try:
-                # Load custom NC model first (faster than MobileNetV2 to load)
                 self._custom_model, self._custom_label_map, self._custom_device = \
                     load_custom_model()
-
-                # Always load MobileNetV2 as fallback
                 self._model = MobileNetV2(weights="imagenet")
-
                 self._client = OpenAI(
                     api_key=GROQ_API_KEY,
-                    base_url="https://api.groq.com/openai/v1",
-                )
+                    base_url="https://api.groq.com/openai/v1")
                 self._models_loaded = True
                 self.model_status_signal.emit("ready")
             except Exception as e:
                 self.model_status_signal.emit(f"error:{e}")
-
-        t = threading.Thread(target=_load, daemon=True)
-        t.start()
+        threading.Thread(target=_load, daemon=True).start()
 
     def _on_model_status(self, status: str):
-        """Slot — always runs on the main Qt thread via signal."""
         if status == "ready":
+            # Tell boot screen models are done → it will finish its animation
+            if hasattr(self, "_boot"):
+                try:
+                    self._boot.mark_ready()
+                except RuntimeError:
+                    pass
             self._loading_lbl.setText("✓  Models ready")
             self._loading_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 11px;")
             QTimer.singleShot(2500, self._loading_lbl.hide)
@@ -1506,6 +1508,8 @@ class NatureDexWindow(QMainWindow):
             self._status_lbl.setText("No camera frame available")
             return
 
+        _play(_WAV_SCAN)  # ← scan beep
+
         frame = self._last_frame.copy()
         self._scan_btn.start_scanning()
         self._status_lbl.setText("Classifying + looking up species data...")
@@ -1518,8 +1522,7 @@ class NatureDexWindow(QMainWindow):
             frame, self._model, self._client,
             custom_model=self._custom_model,
             custom_label_map=self._custom_label_map,
-            custom_device=self._custom_device,
-        )
+            custom_device=self._custom_device)
         self._analysis_worker.result_ready.connect(self._on_result)
         self._analysis_worker.error_occurred.connect(self._on_error)
         self._analysis_worker.start()
@@ -1531,8 +1534,10 @@ class NatureDexWindow(QMainWindow):
             self._scan_overlay.stop()
             self._scan_overlay.hide()
 
+        _play(_WAV_SUCCESS)  # ← success chord
+
         self._current_result = result
-        self._chat_history = []
+        self._chat_history   = []
         self._collection.append(result)
         self._save_collection()
         self._add_collection_card(result, prepend=True)
@@ -1540,7 +1545,6 @@ class NatureDexWindow(QMainWindow):
         self._refresh_category_filter_options()
         self._apply_filters()
         self._check_achievements()
-
         self._render_entry(result)
         self._switch_tab(0)
         self._reset_chat()
@@ -1553,19 +1557,33 @@ class NatureDexWindow(QMainWindow):
             self._scan_overlay.stop()
             self._scan_overlay.hide()
 
-    # ── Entry Rendering ────────────────────────────────────────────────────────
+    # ── Entry Rendering (with fade-in animations) ──────────────────────────────
 
     def _clear_entry(self):
+        self._entry_anims.clear()  # release old animation references
         while self._entry_inner.count():
             item = self._entry_inner.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
+    def _fade_in(self, widget, delay_ms: int):
+        """Fade a widget from invisible to fully visible after delay_ms."""
+        eff = QGraphicsOpacityEffect(widget)
+        eff.setOpacity(0.0)
+        widget.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity")
+        anim.setDuration(280)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._entry_anims.append((anim, eff))  # keep alive
+        QTimer.singleShot(delay_ms, anim.start)
+
     def _render_entry(self, result):
         self._clear_entry()
         entry = result.get("entry", {})
 
-        # ── Name + confidence header
+        # ── Name header
         name_frame = QFrame()
         name_frame.setStyleSheet(f"""
             QFrame {{
@@ -1594,20 +1612,20 @@ class NatureDexWindow(QMainWindow):
 
         if sci and sci != "Unknown":
             sci_lbl = QLabel(sci)
-            sci_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px;")
+            sci_lbl.setStyleSheet(
+                f"color: {C_SUBTEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px;")
             nf_layout.addWidget(sci_lbl)
 
-        # Confidence bar row
-        conf = result["confidence"]
+        conf       = result["confidence"]
         conf_color = C_GREEN if conf >= 75 else C_YELLOW if conf >= 50 else C_RED
-        conf_row = QHBoxLayout()
+        conf_row   = QHBoxLayout()
         conf_row.setSpacing(10)
 
         conf_lbl = QLabel(f"CONFIDENCE  {conf:.1f}%")
-        conf_lbl.setStyleSheet(f"color: {conf_color}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
+        conf_lbl.setStyleSheet(
+            f"color: {conf_color}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
         conf_row.addWidget(conf_lbl)
 
-        # Show which model identified this — custom NC model or MobileNetV2 fallback
         used_custom = result.get("used_custom_model", False)
         model_badge = QLabel("🌿 NatureDex Model" if used_custom else "⚙ MobileNetV2")
         model_badge.setStyleSheet(f"""
@@ -1633,17 +1651,14 @@ class NatureDexWindow(QMainWindow):
         conf_row.addStretch()
         nf_layout.addLayout(conf_row)
 
-        # Rarity row — shown when iNaturalist data is available
-        rarity = result.get("rarity", "")
-        nc_obs = result.get("nc_observations", None)
-        inat = result.get("inat", {})
+        rarity     = result.get("rarity", "")
+        nc_obs     = result.get("nc_observations", None)
+        inat       = result.get("inat", {})
         global_obs = inat.get("observations_count", 0)
 
         if rarity:
             rarity_row = QHBoxLayout()
             rarity_row.setSpacing(8)
-
-            # Color-code rarity: rare = warm, common = cool
             if "Very Rare" in rarity or "Not Recorded" in rarity:
                 rarity_color = C_PURPLE
             elif "Rare" in rarity:
@@ -1651,21 +1666,18 @@ class NatureDexWindow(QMainWindow):
             elif "Uncommon" in rarity:
                 rarity_color = C_YELLOW
             else:
-                rarity_color = C_ACCENT   # neon lime for common
-
+                rarity_color = C_ACCENT
             rarity_lbl = QLabel(f"◈  {rarity}")
-            rarity_lbl.setStyleSheet(f"color: {rarity_color}; font-size: 11px; font-weight: 700;")
+            rarity_lbl.setStyleSheet(
+                f"color: {rarity_color}; font-size: 11px; font-weight: 700;")
             rarity_row.addWidget(rarity_lbl)
-
             if global_obs:
                 global_lbl = QLabel(f"·  {global_obs:,} global observations")
                 global_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px;")
                 rarity_row.addWidget(global_lbl)
-
             rarity_row.addStretch()
             nf_layout.addLayout(rarity_row)
 
-        # Type tags
         tags = entry.get("type_tags", [])
         if tags:
             tag_row = QHBoxLayout()
@@ -1685,8 +1697,8 @@ class NatureDexWindow(QMainWindow):
             nf_layout.addLayout(tag_row)
 
         self._entry_inner.addWidget(name_frame)
+        self._fade_in(name_frame, 0)           # ← fade in immediately
 
-        # ── Description
         desc = entry.get("description", "")
         if desc:
             desc_lbl = QLabel(desc)
@@ -1698,9 +1710,8 @@ class NatureDexWindow(QMainWindow):
                 padding: 4px 0;
             """)
             self._entry_inner.addWidget(desc_lbl)
+            self._fade_in(desc_lbl, 80)        # ← fade in 80ms later
 
-        # ── Info grid
-        # Build the NC context string with real observation count appended
         nc_context = entry.get("north_carolina_context", "")
         if nc_obs is not None and nc_obs > 0 and nc_context and nc_context not in ("Unknown", "N/A"):
             nc_context = f"{nc_context}  ({nc_obs:,} research-grade iNaturalist observations in NC)"
@@ -1715,12 +1726,14 @@ class NatureDexWindow(QMainWindow):
             ("📍  NORTH CAROLINA", nc_context),
             ("⚡  FUN FACT",       entry.get("fun_fact", "")),
         ]
+        delay = 160
         for icon_label, value in fields:
             if value and value not in ("Unknown", "N/A", ""):
                 card = self._make_info_card(icon_label, value)
                 self._entry_inner.addWidget(card)
+                self._fade_in(card, delay)     # ← staggered fade-in
+                delay += 60
 
-        # ── Alternatives
         alts = result.get("alternatives", [])
         if alts:
             alt_frame = QFrame()
@@ -1734,25 +1747,25 @@ class NatureDexWindow(QMainWindow):
             alt_layout = QVBoxLayout(alt_frame)
             alt_layout.setContentsMargins(14, 12, 14, 12)
             alt_layout.setSpacing(6)
-
             alt_title = QLabel("OTHER POSSIBILITIES")
-            alt_title.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px; font-weight: 700; letter-spacing: 2px;")
+            alt_title.setStyleSheet(
+                f"color: {C_SUBTEXT}; font-size: 10px; font-weight: 700; letter-spacing: 2px;")
             alt_layout.addWidget(alt_title)
-
             for a in alts:
-                a_conf = a["confidence"]
+                a_conf  = a["confidence"]
                 a_color = C_GREEN if a_conf >= 20 else C_SUBTEXT
-                row = QHBoxLayout()
-                n_lbl = QLabel(f"• {a['name']}")
+                row     = QHBoxLayout()
+                n_lbl   = QLabel(f"• {a['name']}")
                 n_lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 12px;")
-                c_lbl = QLabel(f"{a_conf:.1f}%")
-                c_lbl.setStyleSheet(f"color: {a_color}; font-size: 11px; font-weight: 600;")
+                c_lbl   = QLabel(f"{a_conf:.1f}%")
+                c_lbl.setStyleSheet(
+                    f"color: {a_color}; font-size: 11px; font-weight: 600;")
                 row.addWidget(n_lbl)
                 row.addStretch()
                 row.addWidget(c_lbl)
                 alt_layout.addLayout(row)
-
             self._entry_inner.addWidget(alt_frame)
+            self._fade_in(alt_frame, delay)
 
         self._entry_inner.addStretch()
 
@@ -1769,13 +1782,12 @@ class NatureDexWindow(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 9, 14, 9)
         layout.setSpacing(3)
-
         lbl = QLabel(label)
-        lbl.setStyleSheet(f"color: {C_ACCENT}; font-size: 9px; font-weight: 800; letter-spacing: 1.5px;")
+        lbl.setStyleSheet(
+            f"color: {C_ACCENT}; font-size: 9px; font-weight: 800; letter-spacing: 1.5px;")
         val = QLabel(value)
         val.setWordWrap(True)
         val.setStyleSheet(f"color: {C_TEXT}; font-size: 12px;")
-
         layout.addWidget(lbl)
         layout.addWidget(val)
         return card
@@ -1794,7 +1806,7 @@ class NatureDexWindow(QMainWindow):
 
     def _on_collection_click(self, entry_data):
         self._current_result = entry_data
-        self._chat_history = []
+        self._chat_history   = []
         self._render_entry(entry_data)
         self._switch_tab(0)
         self._reset_chat()
@@ -1803,26 +1815,24 @@ class NatureDexWindow(QMainWindow):
     def _on_delete_entry(self, timestamp):
         if not timestamp:
             return
-        # Remove from the underlying collection list
-        self._collection = [e for e in self._collection if e.get("timestamp") != timestamp]
+        self._collection = [e for e in self._collection
+                            if e.get("timestamp") != timestamp]
         self._save_collection()
-
-        # Remove the matching card widget from the sidebar
         for i in range(self._collection_layout.count()):
-            item = self._collection_layout.itemAt(i)
+            item   = self._collection_layout.itemAt(i)
             widget = item.widget() if item else None
-            if isinstance(widget, CollectionCard) and widget.entry_data.get("timestamp") == timestamp:
+            if isinstance(widget, CollectionCard) and \
+               widget.entry_data.get("timestamp") == timestamp:
                 widget.deleteLater()
                 break
-
-        self._species_count_lbl.setText(f"◈  {len(self._collection)} discovered")
+        self._species_count_lbl.setText(f"{len(self._collection)} discovered")
         self._refresh_category_filter_options()
-
-        # If the deleted entry was being shown in the main panel, clear it
-        if self._current_result and self._current_result.get("timestamp") == timestamp:
+        if self._current_result and \
+           self._current_result.get("timestamp") == timestamp:
             self._current_result = None
             self._clear_entry()
-            self._placeholder_lbl = QLabel("Scan an object to generate\na NatureDex entry.")
+            self._placeholder_lbl = QLabel(
+                "Scan an object to generate\na NatureDex entry.")
             self._placeholder_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._placeholder_lbl.setStyleSheet(f"""
                 color: {C_SUBTEXT};
@@ -1837,14 +1847,11 @@ class NatureDexWindow(QMainWindow):
     # ── Search & Filter ────────────────────────────────────────────────────────
 
     def _refresh_category_filter_options(self):
-        """Repopulate the category dropdown with whatever categories actually
-        exist in the collection, preserving the current selection if possible."""
         current = self._category_filter.currentText()
         categories = sorted({
             e.get("entry", {}).get("category", "Unknown") or "Unknown"
             for e in self._collection
         })
-
         self._category_filter.blockSignals(True)
         self._category_filter.clear()
         self._category_filter.addItem("All Categories")
@@ -1854,28 +1861,21 @@ class NatureDexWindow(QMainWindow):
         self._category_filter.blockSignals(False)
 
     def _apply_filters(self):
-        """Show/hide collection cards based on the current search text and
-        category selection. Hiding (rather than rebuilding) keeps this fast
-        and avoids losing scroll position while typing."""
-        query = self._search_input.text().strip().lower()
+        query    = self._search_input.text().strip().lower()
         category = self._category_filter.currentText()
-
-        visible_count = 0
+        visible  = 0
         for i in range(self._collection_layout.count()):
-            item = self._collection_layout.itemAt(i)
+            item   = self._collection_layout.itemAt(i)
             widget = item.widget() if item else None
             if not isinstance(widget, CollectionCard):
                 continue
-
-            matches_search = (query in widget._search_text) if query else True
-            matches_category = (category == "All Categories") or (widget._category == category)
-            should_show = matches_search and matches_category
-
-            widget.setVisible(should_show)
-            if should_show:
-                visible_count += 1
-
-        self._empty_filter_lbl.setVisible(visible_count == 0 and len(self._collection) > 0)
+            ms = (query in widget._search_text) if query else True
+            mc = (category == "All Categories") or (widget._category == category)
+            widget.setVisible(ms and mc)
+            if ms and mc:
+                visible += 1
+        self._empty_filter_lbl.setVisible(
+            visible == 0 and len(self._collection) > 0)
 
     # ── Achievements ───────────────────────────────────────────────────────────
 
@@ -1889,40 +1889,34 @@ class NatureDexWindow(QMainWindow):
 
     def _save_achievements(self):
         try:
-            ACHIEVEMENTS_FILE.write_text(json.dumps(sorted(self._unlocked_achievements)))
+            ACHIEVEMENTS_FILE.write_text(
+                json.dumps(sorted(self._unlocked_achievements)))
         except Exception as e:
             print(f"Could not save achievements: {e}")
 
     def _check_achievements(self):
-        """Compare current collection stats against achievement thresholds.
-        Any newly-crossed thresholds get unlocked and (the first one) toasted."""
-        count = len(self._collection)
-        categories = {
+        count  = len(self._collection)
+        n_cats = len({
             e.get("entry", {}).get("category", "Unknown") or "Unknown"
             for e in self._collection
-        }
-        num_categories = len(categories)
-
-        newly_unlocked = []
+        })
+        newly = []
         for badge in ACHIEVEMENTS:
             if badge["id"] in self._unlocked_achievements:
                 continue
-            if badge["type"] == "count" and count >= badge["threshold"]:
-                newly_unlocked.append(badge)
-            elif badge["type"] == "category" and num_categories >= badge["threshold"]:
-                newly_unlocked.append(badge)
-
-        if not newly_unlocked:
+            if badge["type"] == "count"    and count  >= badge["threshold"]:
+                newly.append(badge)
+            elif badge["type"] == "category" and n_cats >= badge["threshold"]:
+                newly.append(badge)
+        if not newly:
             return
-
-        for badge in newly_unlocked:
+        for badge in newly:
             self._unlocked_achievements.add(badge["id"])
         self._save_achievements()
-
-        # Toast the first new badge now; if multiple unlocked at once, queue
-        # the rest with a slight delay so they don't all overlap visually.
-        for idx, badge in enumerate(newly_unlocked):
-            QTimer.singleShot(idx * 3500, lambda b=badge: self._toast.show_achievement(b["icon"], b["name"]))
+        for idx, badge in enumerate(newly):
+            QTimer.singleShot(
+                idx * 3500,
+                lambda b=badge: self._toast.show_achievement(b["icon"], b["name"]))
 
     def _show_badges_panel(self):
         panel = QFrame(self)
@@ -1934,7 +1928,6 @@ class NatureDexWindow(QMainWindow):
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(0)
 
-        # Header — title + close, no box
         header_row = QHBoxLayout()
         title = QLabel("Achievements")
         title.setStyleSheet(f"color: {C_TEXT}; font-size: 16px; font-weight: 800;")
@@ -1961,18 +1954,16 @@ class NatureDexWindow(QMainWindow):
 
         for badge in ACHIEVEMENTS:
             unlocked = badge["id"] in self._unlocked_achievements
-
             row = QWidget()
             row.setStyleSheet("background: transparent;")
             r_layout = QHBoxLayout(row)
             r_layout.setContentsMargins(0, 8, 0, 8)
             r_layout.setSpacing(14)
-
             icon = QLabel(badge["icon"] if unlocked else "🔒")
-            icon.setStyleSheet(f"font-size: 18px; color: {'inherit' if unlocked else C_SUBTEXT};")
+            icon.setStyleSheet(
+                f"font-size: 18px; color: {'inherit' if unlocked else C_SUBTEXT};")
             icon.setFixedWidth(26)
             r_layout.addWidget(icon)
-
             text_box = QVBoxLayout()
             text_box.setSpacing(2)
             name_lbl = QLabel(badge["name"])
@@ -1987,15 +1978,12 @@ class NatureDexWindow(QMainWindow):
             text_box.addWidget(desc_lbl)
             r_layout.addLayout(text_box)
             r_layout.addStretch()
-
             if unlocked:
                 check = QLabel("✓")
-                check.setStyleSheet(f"color: {C_ACCENT}; font-size: 14px; font-weight: 800;")
+                check.setStyleSheet(
+                    f"color: {C_ACCENT}; font-size: 14px; font-weight: 800;")
                 r_layout.addWidget(check)
-
             c_layout.addWidget(row)
-
-            # Hairline divider between rows — one pixel, barely visible
             if badge != ACHIEVEMENTS[-1]:
                 line = QFrame()
                 line.setFixedHeight(1)
@@ -2005,7 +1993,6 @@ class NatureDexWindow(QMainWindow):
         c_layout.addStretch()
         scroll.setWidget(content)
         layout.addWidget(scroll, stretch=1)
-
         panel.show()
         panel.raise_()
 
@@ -2016,37 +2003,38 @@ class NatureDexWindow(QMainWindow):
             item = self._chat_inner.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-
         if self._current_result:
             entry = self._current_result.get("entry", {})
-            name = entry.get("common_name", self._current_result.get("name", "this organism"))
+            name  = entry.get(
+                "common_name",
+                self._current_result.get("name", "this organism"))
             intro = QLabel(f'Ask me anything about\n"{name}"')
             intro.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            intro.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px; padding: 30px 0;")
+            intro.setStyleSheet(
+                f"color: {C_SUBTEXT}; font-size: 13px; padding: 30px 0;")
             self._chat_inner.addWidget(intro)
         else:
             intro = QLabel("Scan something first to\nstart a conversation.")
             intro.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            intro.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px; padding: 40px 0;")
+            intro.setStyleSheet(
+                f"color: {C_SUBTEXT}; font-size: 13px; padding: 40px 0;")
             self._chat_inner.addWidget(intro)
-
         self._chat_inner.addStretch()
 
     def _on_chat_send(self):
         text = self._chat_input.text().strip()
         if not text or not self._current_result:
             if not self._current_result:
-                self._add_chat_bubble("Scan something first, then ask me about it!", is_user=False)
+                self._add_chat_bubble(
+                    "Scan something first, then ask me about it!", is_user=False)
             return
         if not self._client:
-            self._add_chat_bubble("AI model is still loading — try again in a moment.", is_user=False)
+            self._add_chat_bubble(
+                "AI model is still loading — try again in a moment.", is_user=False)
             return
         self._chat_input.clear()
-
-        # User bubble
         self._add_chat_bubble(text, is_user=True)
 
-        # Build system context
         entry = self._current_result.get("entry", {})
         system = f"""You are NatureDex AI, a knowledgeable wildlife educator.
 The user has just scanned: {self._current_result.get('name', 'an organism')}.
@@ -2057,24 +2045,18 @@ Answer questions in an engaging, educational tone — like a Pokédex that can c
 Keep responses concise (2-4 sentences). Focus on the organism or object scanned.
 If asked about North Carolina specifically, provide NC-relevant context."""
 
-        messages = [{"role": "system", "content": system}]
-        messages += self._chat_history
-        messages.append({"role": "user", "content": text})
-
+        messages = ([{"role": "system", "content": system}]
+                    + self._chat_history
+                    + [{"role": "user", "content": text}])
         thinking = self._add_chat_bubble("Thinking...", is_user=False)
-
-        # Store worker on self so it isn't garbage-collected while the thread
-        # is still running — that was causing the window to crash and close.
         self._chat_worker = ChatWorker(self._client, messages)
 
         def on_reply(reply):
-            # Guard against the thinking label having been deleted (e.g. if
-            # the user deleted the entry or cleared the chat mid-request).
             try:
                 thinking.setText(reply)
             except RuntimeError:
-                pass  # widget was deleted before reply came back — safe to ignore
-            self._chat_history.append({"role": "user", "content": text})
+                pass
+            self._chat_history.append({"role": "user",      "content": text})
             self._chat_history.append({"role": "assistant", "content": reply})
 
         self._chat_worker.reply_ready.connect(on_reply)
@@ -2093,7 +2075,6 @@ If asked about North Carolina specifically, provide NC-relevant context."""
                 font-size: 13px;
                 font-weight: 500;
             """)
-            align = Qt.AlignmentFlag.AlignRight
         else:
             bubble.setStyleSheet(f"""
                 background: {C_CARD};
@@ -2103,9 +2084,7 @@ If asked about North Carolina specifically, provide NC-relevant context."""
                 padding: 8px 14px;
                 font-size: 13px;
             """)
-            align = Qt.AlignmentFlag.AlignLeft
-
-        wrapper = QWidget()
+        wrapper  = QWidget()
         w_layout = QHBoxLayout(wrapper)
         w_layout.setContentsMargins(0, 0, 0, 0)
         if is_user:
@@ -2113,14 +2092,11 @@ If asked about North Carolina specifically, provide NC-relevant context."""
         w_layout.addWidget(bubble)
         if not is_user:
             w_layout.addStretch()
-
-        count = self._chat_inner.count()
-        self._chat_inner.insertWidget(count - 1, wrapper)
-
-        # Scroll to bottom
-        QTimer.singleShot(50, lambda: self._chat_scroll.verticalScrollBar().setValue(
-            self._chat_scroll.verticalScrollBar().maximum()
-        ))
+        self._chat_inner.insertWidget(self._chat_inner.count() - 1, wrapper)
+        QTimer.singleShot(
+            50,
+            lambda: self._chat_scroll.verticalScrollBar().setValue(
+                self._chat_scroll.verticalScrollBar().maximum()))
         return bubble
 
     # ── Persistence ────────────────────────────────────────────────────────────
@@ -2139,7 +2115,7 @@ If asked about North Carolina specifically, provide NC-relevant context."""
         except Exception as e:
             print(f"Could not save collection: {e}")
 
-    # ── Correction / Feedback System ───────────────────────────────────────────
+    # ── Correction System ──────────────────────────────────────────────────────
 
     def _on_report_wrong_id(self):
         if not self._current_result:
@@ -2158,31 +2134,27 @@ If asked about North Carolina specifically, provide NC-relevant context."""
         self._correction_bar.hide()
         self._correction_input.clear()
         self._report_btn.setText("⚑  Thanks for the correction!")
-        QTimer.singleShot(3000, lambda: self._report_btn.setText("⚑  Wrong ID? Report it"))
+        QTimer.singleShot(
+            3000, lambda: self._report_btn.setText("⚑  Wrong ID? Report it"))
 
     def _on_correction_cancel(self):
         self._correction_bar.hide()
         self._correction_input.clear()
 
     def _save_correction(self, correct_name: str):
-        """Append one correction record to the local corrections log.
-        Each record has everything needed for Phase 4 model training:
-        the original model label, user's correction, confidence, and timestamp."""
         result = self._current_result or {}
-        entry = result.get("entry", {})
-
+        entry  = result.get("entry", {})
         record = {
-            "timestamp":        datetime.datetime.now().isoformat(),
-            "original_label":   result.get("raw_label", ""),
-            "original_name":    result.get("name", ""),
-            "confidence":       result.get("confidence", 0),
-            "correct_name":     correct_name,
-            "scientific_name":  entry.get("scientific_name", ""),
-            "category":         entry.get("category", ""),
-            "inat_taxon_id":    result.get("inat", {}).get("taxon_id"),
-            "image_path":       result.get("image_path", ""),
+            "timestamp":      datetime.datetime.now().isoformat(),
+            "original_label": result.get("raw_label", ""),
+            "original_name":  result.get("name", ""),
+            "confidence":     result.get("confidence", 0),
+            "correct_name":   correct_name,
+            "scientific_name":entry.get("scientific_name", ""),
+            "category":       entry.get("category", ""),
+            "inat_taxon_id":  result.get("inat", {}).get("taxon_id"),
+            "image_path":     result.get("image_path", ""),
         }
-
         try:
             corrections = []
             if CORRECTIONS_FILE.exists():
@@ -2194,11 +2166,6 @@ If asked about North Carolina specifically, provide NC-relevant context."""
             print(f"Could not save correction: {e}")
 
     # ── Cleanup ────────────────────────────────────────────────────────────────
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._toast:
-            self._toast.move(self.width() - 300, 70)
 
     def closeEvent(self, event):
         if self._camera_thread:
