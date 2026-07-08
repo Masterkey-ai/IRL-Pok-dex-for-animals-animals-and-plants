@@ -35,6 +35,12 @@ from PyQt6.QtGui import (
     QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
     QLinearGradient, QPalette, QFontDatabase, QIcon
 )
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
+    _HAS_WEBENGINE = True
+except ImportError:
+    _HAS_WEBENGINE = False
 
 import cv2
 from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, decode_predictions, preprocess_input
@@ -216,6 +222,47 @@ def _nc_rarity_label(nc_count: int) -> str:
     elif nc_count < 1000:  return "Uncommon in NC"
     elif nc_count < 10000: return "Common in NC"
     else:                  return "Very Common in NC"
+
+
+def _fetch_observation_coords(taxon_id: int, max_obs: int = 80) -> list[dict]:
+    """Fetch research-grade observation coordinates for a taxon from iNaturalist.
+    Returns list of dicts with lat, lng, place_name, observed_on, quality."""
+    if not taxon_id:
+        return []
+    try:
+        params = urllib.parse.urlencode({
+            "taxon_id":     taxon_id,
+            "quality_grade":"research",
+            "per_page":     max_obs,
+            "order":        "votes",
+            "order_by":     "votes",
+            "geo":          "true",
+        })
+        req = urllib.request.Request(
+            f"https://api.inaturalist.org/v1/observations?{params}",
+            headers={"User-Agent": "NatureDexAI/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        coords = []
+        for obs in data.get("results", []):
+            loc = obs.get("location")
+            if not loc:
+                continue
+            try:
+                lat, lng = map(float, loc.split(","))
+            except Exception:
+                continue
+            coords.append({
+                "lat":         lat,
+                "lng":         lng,
+                "place":       obs.get("place_guess", ""),
+                "observed_on": obs.get("observed_on", ""),
+                "quality":     obs.get("quality_grade", ""),
+            })
+        return coords
+    except Exception as e:
+        print(f"[Map] Coord fetch error: {e}")
+        return []
 
 # ─── Custom NC Model ──────────────────────────────────────────────────────────
 
@@ -961,6 +1008,7 @@ class CollectionCard(QFrame):
 class NatureDexWindow(QMainWindow):
 
     model_status_signal = pyqtSignal(str)
+    map_html_signal     = pyqtSignal(str)  # emits full HTML from background thread
 
     def __init__(self):
         super().__init__()
@@ -1005,6 +1053,7 @@ class NatureDexWindow(QMainWindow):
 
         self._start_camera()
         self.model_status_signal.connect(self._on_model_status)
+        self.map_html_signal.connect(self._on_map_html)
         self._load_models_async()
 
         self._toast = ToastNotification(self)
@@ -1281,17 +1330,21 @@ class NatureDexWindow(QMainWindow):
 
         self._tab_entry_btn = self._make_tab_btn("ENTRY", True)
         self._tab_chat_btn  = self._make_tab_btn("ASK AI", False)
+        self._tab_map_btn   = self._make_tab_btn("MAP", False)
         self._tab_entry_btn.clicked.connect(lambda: self._switch_tab(0))
         self._tab_chat_btn.clicked.connect(lambda: self._switch_tab(1))
+        self._tab_map_btn.clicked.connect(lambda: self._switch_tab(2))
 
         tab_layout.addWidget(self._tab_entry_btn)
         tab_layout.addWidget(self._tab_chat_btn)
+        tab_layout.addWidget(self._tab_map_btn)
         tab_layout.addStretch()
         layout.addWidget(tab_bar)
 
         self._tab_stack = QStackedWidget()
         self._tab_stack.addWidget(self._build_entry_tab())
         self._tab_stack.addWidget(self._build_chat_tab())
+        self._tab_stack.addWidget(self._build_map_tab())
         layout.addWidget(self._tab_stack, stretch=1)
         return panel
 
@@ -1333,6 +1386,10 @@ class NatureDexWindow(QMainWindow):
         self._tab_stack.setCurrentIndex(idx)
         self._set_tab_style(self._tab_entry_btn, idx == 0)
         self._set_tab_style(self._tab_chat_btn,  idx == 1)
+        self._set_tab_style(self._tab_map_btn,   idx == 2)
+        # Load map when switching to it
+        if idx == 2 and self._current_result:
+            self._update_map(self._current_result)
 
     def _build_entry_tab(self):
         widget = QWidget()
@@ -1451,6 +1508,236 @@ class NatureDexWindow(QMainWindow):
         f_layout.addWidget(self._report_btn)
         layout.addWidget(footer)
         return widget
+
+    def _build_map_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        if _HAS_WEBENGINE:
+            self._map_view = QWebEngineView()
+            self._map_view.settings().setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            self._map_view.setStyleSheet(f"background: {C_BG};")
+            layout.addWidget(self._map_view)
+            # Show placeholder until a scan is done
+            self._map_view.setHtml(self._map_placeholder_html())
+        else:
+            # Fallback if WebEngine not available
+            lbl = QLabel("Map requires PyQt6-WebEngine.\nRun: pip3 install PyQt6-WebEngine")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px;")
+            layout.addWidget(lbl)
+            self._map_view = None
+
+        return widget
+
+    def _map_placeholder_html(self) -> str:
+        return f"""<!DOCTYPE html><html><body style="margin:0;background:{C_BG};
+            display:flex;align-items:center;justify-content:center;height:100vh;
+            font-family:sans-serif;color:{C_SUBTEXT};font-size:14px;">
+            <div style="text-align:center">
+                <div style="font-size:40px;margin-bottom:12px">🗺️</div>
+                <div>Scan a species to see its distribution map</div>
+            </div></body></html>"""
+
+    def _update_map(self, result: dict):
+        """Build and load a Leaflet.js map for the current result.
+        Fetches iNaturalist observation coordinates in a background thread
+        and emits map_html_signal when done — safe cross-thread UI update."""
+        if not _HAS_WEBENGINE or not self._map_view:
+            return
+
+        taxon_id = result.get("inat", {}).get("taxon_id")
+        name     = result.get("name", "Unknown")
+        sci      = result.get("entry", {}).get("scientific_name", "")
+        rarity   = result.get("rarity", "")
+
+        # Show loading state immediately (we're on main thread here)
+        self._map_view.setHtml(f"""<!DOCTYPE html><html>
+<body style="margin:0;background:{C_BG};display:flex;align-items:center;
+justify-content:center;height:100vh;font-family:sans-serif;color:{C_SUBTEXT};font-size:14px;">
+<div style="text-align:center">
+    <div style="font-size:32px;margin-bottom:12px">🔍</div>
+    <div>Loading observation data for <b style="color:{C_TEXT}">{name}</b>...</div>
+</div></body></html>""")
+
+        def _fetch():
+            coords = _fetch_observation_coords(taxon_id) if taxon_id else []
+            html   = self._build_map_html(name, sci, rarity, coords)
+            # Emit signal — safely crosses thread boundary to main Qt thread
+            self.map_html_signal.emit(html)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _on_map_html(self, html: str):
+        """Slot — always runs on main Qt thread. Loads the map HTML."""
+        if self._map_view:
+            self._map_view.setHtml(html)
+
+    def _build_map_html(self, name: str, sci: str, rarity: str,
+                        coords: list[dict]) -> str:
+        """Build a Leaflet.js map with dark tiles, clustered pins, and popups."""
+        if coords:
+            nc_coords = [c for c in coords if 33 < c["lat"] < 37 and -85 < c["lng"] < -75]
+            if nc_coords:
+                center_lat = sum(c["lat"] for c in nc_coords) / len(nc_coords)
+                center_lng = sum(c["lng"] for c in nc_coords) / len(nc_coords)
+                zoom = 7
+            else:
+                center_lat = sum(c["lat"] for c in coords) / len(coords)
+                center_lng = sum(c["lng"] for c in coords) / len(coords)
+                zoom = 4
+        else:
+            center_lat, center_lng, zoom = 35.5, -79.0, 6
+
+        obs_js = json.dumps([{
+            "lat":   c["lat"],
+            "lng":   c["lng"],
+            "place": c.get("place", "Unknown location"),
+            "date":  c.get("observed_on", ""),
+        } for c in coords])
+
+        rarity_color = {
+            "Very Rare in NC":  "#8e5fb5",
+            "Rare in NC":       "#c0392b",
+            "Uncommon in NC":   "#d4a017",
+            "Common in NC":     "#e8720c",
+            "Very Common in NC":"#6abf5e",
+        }.get(rarity, "#e8720c")
+
+        sci_html = (f'<div style="color:#7a9060;font-style:italic;font-size:11px;'
+                    f'margin-bottom:6px">{sci}</div>'
+                    if sci and sci not in ("Unknown", "N/A", "") else "")
+
+        no_obs_html = (
+            '<div style="color:#7a9060;font-size:12px;margin-top:8px">'
+            'No iNaturalist observations found</div>'
+            if not coords else ""
+        )
+
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet"
+  href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+<link rel="stylesheet"
+  href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:{C_BG}; font-family:sans-serif; }}
+  #map {{ width:100%; height:100vh; }}
+  .leaflet-popup-content-wrapper {{
+    background: #1a1f14;
+    color: #f0ead8;
+    border: 1px solid #3a4a2a;
+    border-radius: 8px;
+    font-size: 12px;
+  }}
+  .leaflet-popup-tip {{ background: #1a1f14; }}
+  .leaflet-popup-close-button {{ color: #7a9060 !important; }}
+  .obs-popup-place {{ font-weight:700; color:#f0ead8; }}
+  .obs-popup-date  {{ color:#7a9060; font-size:11px; margin-top:2px; }}
+  .legend {{
+    position:fixed; bottom:16px; right:16px;
+    background:rgba(26,31,20,0.95);
+    border:1px solid #3a4a2a;
+    border-radius:8px;
+    padding:12px 16px;
+    color:#f0ead8;
+    font-size:11px;
+    line-height:2;
+    z-index:1000;
+    max-width:220px;
+  }}
+  .legend-name {{
+    font-size:13px; font-weight:800;
+    color:#f0ead8; display:block; margin-bottom:2px;
+  }}
+  .marker-cluster-small,
+  .marker-cluster-medium,
+  .marker-cluster-large {{
+    background-color: rgba(106,191,94,0.3) !important;
+  }}
+  .marker-cluster-small div,
+  .marker-cluster-medium div,
+  .marker-cluster-large div {{
+    background-color: rgba(106,191,94,0.7) !important;
+    color: #1a1f14 !important;
+    font-weight: 700;
+  }}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="legend">
+  <span class="legend-name">{name}</span>
+  {sci_html}
+  <span style="color:{rarity_color}">◈ {rarity}</span><br/>
+  <span style="display:inline-block;width:10px;height:10px;border-radius:50%;
+    background:#6abf5e;margin-right:6px;vertical-align:middle"></span>
+  {len(coords)} iNaturalist observations
+  {no_obs_html}
+</div>
+<script>
+var map = L.map('map', {{
+    center: [{center_lat}, {center_lng}],
+    zoom: {zoom}
+}});
+
+// Dark basemap tiles
+L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+    attribution: '&copy; OpenStreetMap &copy; CARTO',
+    subdomains: 'abcd',
+    maxZoom: 18
+}}).addTo(map);
+
+var obsData = {obs_js};
+
+// Marker cluster group
+var markers = L.markerClusterGroup({{
+    maxClusterRadius: 40,
+    showCoverageOnHover: false,
+}});
+
+obsData.forEach(function(obs) {{
+    var circle = L.circleMarker([obs.lat, obs.lng], {{
+        radius: 6,
+        fillColor: '#6abf5e',
+        color: '#1a1f14',
+        weight: 1.5,
+        opacity: 1,
+        fillOpacity: 0.85
+    }});
+    var popup = '<div class="obs-popup-place">'
+        + (obs.place || 'Unknown location')
+        + '</div>'
+        + (obs.date
+            ? '<div class="obs-popup-date">Observed: ' + obs.date + '</div>'
+            : '');
+    circle.bindPopup(popup);
+    markers.addLayer(circle);
+}});
+
+map.addLayer(markers);
+
+if (obsData.length > 1) {{
+    var lats = obsData.map(function(o){{return o.lat;}});
+    var lngs = obsData.map(function(o){{return o.lng;}});
+    var pad = 1.0;
+    map.fitBounds([
+        [Math.min.apply(null,lats)-pad, Math.min.apply(null,lngs)-pad],
+        [Math.max.apply(null,lats)+pad, Math.max.apply(null,lngs)+pad]
+    ]);
+}}
+</script>
+</body>
+</html>"""
 
     def _build_chat_tab(self):
         widget = QWidget()
