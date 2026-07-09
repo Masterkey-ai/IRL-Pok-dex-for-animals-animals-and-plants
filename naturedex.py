@@ -1300,6 +1300,26 @@ class NatureDexWindow(QMainWindow):
         self._scan_btn = ScanButton()
         self._scan_btn.clicked.connect(self._on_scan)
 
+        self._cancel_btn = QPushButton("✕  Cancel")
+        self._cancel_btn.setFixedSize(100, 38)
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.hide()
+        self._cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {C_SUBTEXT};
+                border: 1px solid {C_BORDER};
+                border-radius: 19px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                color: {C_RED};
+                border-color: {C_RED};
+            }}
+        """)
+        self._cancel_btn.clicked.connect(self._on_cancel_scan)
+
         hint = QLabel("Point camera at any\nplant, animal, or object")
         hint.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px; line-height: 1.5;")
         hint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -1308,6 +1328,7 @@ class NatureDexWindow(QMainWindow):
         self._loading_lbl.setStyleSheet(f"color: {C_ACCENT}; font-size: 11px;")
 
         c_layout.addWidget(self._scan_btn)
+        c_layout.addWidget(self._cancel_btn)
         c_layout.addWidget(hint)
         c_layout.addStretch()
         c_layout.addWidget(self._loading_lbl)
@@ -1328,16 +1349,19 @@ class NatureDexWindow(QMainWindow):
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.setSpacing(0)
 
-        self._tab_entry_btn = self._make_tab_btn("ENTRY", True)
-        self._tab_chat_btn  = self._make_tab_btn("ASK AI", False)
-        self._tab_map_btn   = self._make_tab_btn("MAP", False)
+        self._tab_entry_btn   = self._make_tab_btn("ENTRY",   True)
+        self._tab_chat_btn    = self._make_tab_btn("ASK AI",  False)
+        self._tab_map_btn     = self._make_tab_btn("MAP",     False)
+        self._tab_gallery_btn = self._make_tab_btn("GALLERY", False)
         self._tab_entry_btn.clicked.connect(lambda: self._switch_tab(0))
         self._tab_chat_btn.clicked.connect(lambda: self._switch_tab(1))
         self._tab_map_btn.clicked.connect(lambda: self._switch_tab(2))
+        self._tab_gallery_btn.clicked.connect(lambda: self._switch_tab(3))
 
         tab_layout.addWidget(self._tab_entry_btn)
         tab_layout.addWidget(self._tab_chat_btn)
         tab_layout.addWidget(self._tab_map_btn)
+        tab_layout.addWidget(self._tab_gallery_btn)
         tab_layout.addStretch()
         layout.addWidget(tab_bar)
 
@@ -1345,13 +1369,14 @@ class NatureDexWindow(QMainWindow):
         self._tab_stack.addWidget(self._build_entry_tab())
         self._tab_stack.addWidget(self._build_chat_tab())
         self._tab_stack.addWidget(self._build_map_tab())
+        self._tab_stack.addWidget(self._build_gallery_tab())
         layout.addWidget(self._tab_stack, stretch=1)
         return panel
 
     def _make_tab_btn(self, text, active):
         btn = QPushButton(text)
         btn.setFixedHeight(44)
-        btn.setFixedWidth(110)
+        btn.setFixedWidth(88)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._set_tab_style(btn, active)
         return btn
@@ -1384,12 +1409,14 @@ class NatureDexWindow(QMainWindow):
 
     def _switch_tab(self, idx):
         self._tab_stack.setCurrentIndex(idx)
-        self._set_tab_style(self._tab_entry_btn, idx == 0)
-        self._set_tab_style(self._tab_chat_btn,  idx == 1)
-        self._set_tab_style(self._tab_map_btn,   idx == 2)
-        # Load map when switching to it
+        self._set_tab_style(self._tab_entry_btn,   idx == 0)
+        self._set_tab_style(self._tab_chat_btn,    idx == 1)
+        self._set_tab_style(self._tab_map_btn,     idx == 2)
+        self._set_tab_style(self._tab_gallery_btn, idx == 3)
         if idx == 2 and self._current_result:
             self._update_map(self._current_result)
+        if idx == 3:
+            self._refresh_gallery()
 
     def _build_entry_tab(self):
         widget = QWidget()
@@ -1739,6 +1766,166 @@ if (obsData.length > 1) {{
 </body>
 </html>"""
 
+    def _build_gallery_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header
+        header = QFrame()
+        header.setFixedHeight(40)
+        header.setStyleSheet(f"background: {C_PANEL};")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(16, 0, 16, 0)
+        title = QLabel("SCAN GALLERY")
+        title.setStyleSheet(
+            f"color: {C_SUBTEXT}; font-size: 10px; font-weight: 700; letter-spacing: 2px;")
+        self._gallery_count_lbl = QLabel("")
+        self._gallery_count_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px;")
+        hl.addWidget(title)
+        hl.addStretch()
+        hl.addWidget(self._gallery_count_lbl)
+        layout.addWidget(header)
+
+        # Scrollable grid
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background: transparent; border: none;")
+
+        self._gallery_container = QWidget()
+        self._gallery_container.setStyleSheet("background: transparent;")
+        self._gallery_grid = QVBoxLayout(self._gallery_container)
+        self._gallery_grid.setContentsMargins(12, 12, 12, 12)
+        self._gallery_grid.setSpacing(8)
+
+        placeholder = QLabel("Scans will appear here after you scan species")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px; padding: 60px 20px;")
+        self._gallery_grid.addWidget(placeholder)
+        self._gallery_grid.addStretch()
+
+        scroll.setWidget(self._gallery_container)
+        layout.addWidget(scroll, stretch=1)
+
+        self._gallery_scroll = scroll
+        return widget
+
+    def _refresh_gallery(self):
+        """Rebuild the gallery grid from saved scan images."""
+        # Clear existing
+        while self._gallery_grid.count():
+            item = self._gallery_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Get all entries that have a saved image
+        entries_with_images = [
+            e for e in reversed(self._collection)
+            if e.get("saved_image_path") and
+               Path(e["saved_image_path"]).exists()
+        ]
+
+        if not entries_with_images:
+            msg = QLabel("No scan images yet.\nScan a species to build your gallery!")
+            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            msg.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px; padding: 60px 20px;")
+            self._gallery_grid.addWidget(msg)
+            self._gallery_grid.addStretch()
+            self._gallery_count_lbl.setText("")
+            return
+
+        self._gallery_count_lbl.setText(f"{len(entries_with_images)} scans")
+
+        # Build rows of 3 thumbnails
+        COLS = 3
+        THUMB = 120
+
+        row_widget = None
+        row_layout = None
+
+        for i, entry in enumerate(entries_with_images):
+            if i % COLS == 0:
+                row_widget = QWidget()
+                row_widget.setStyleSheet("background: transparent;")
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+                self._gallery_grid.addWidget(row_widget)
+
+            # Thumbnail card
+            card = QFrame()
+            card.setFixedSize(THUMB, THUMB + 36)
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background: {C_CARD};
+                    border-radius: 8px;
+                    border: none;
+                }}
+                QFrame:hover {{
+                    background: #254225;
+                    border: 1px solid {C_ACCENT};
+                }}
+            """)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            card_layout.setSpacing(0)
+
+            # Thumbnail image
+            img_lbl = QLabel()
+            img_lbl.setFixedSize(THUMB, THUMB)
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img_lbl.setStyleSheet("border-radius: 8px 8px 0 0; background: #000;")
+            try:
+                px = QPixmap(entry["saved_image_path"])
+                if not px.isNull():
+                    px = px.scaled(THUMB, THUMB,
+                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+                    # Center-crop
+                    if px.width() > THUMB or px.height() > THUMB:
+                        x = (px.width()  - THUMB) // 2
+                        y = (px.height() - THUMB) // 2
+                        px = px.copy(x, y, THUMB, THUMB)
+                    img_lbl.setPixmap(px)
+            except Exception:
+                img_lbl.setText("📷")
+            card_layout.addWidget(img_lbl)
+
+            # Species name label
+            name_lbl = QLabel(entry.get("name", "Unknown")[:14])
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_lbl.setStyleSheet(
+                f"color: {C_TEXT}; font-size: 9px; font-weight: 600; padding: 4px 4px 2px 4px;")
+            date_lbl = QLabel(entry.get("timestamp", "")[:10])
+            date_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            date_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 8px; padding: 0 4px 4px 4px;")
+            card_layout.addWidget(name_lbl)
+            card_layout.addWidget(date_lbl)
+
+            # Click to load entry
+            def make_click(e):
+                def handler(ev):
+                    self._on_collection_click(e)
+                    self._switch_tab(0)
+                return handler
+            card.mousePressEvent = make_click(entry)
+
+            row_layout.addWidget(card)
+
+        # Pad last row if needed
+        remainder = len(entries_with_images) % COLS
+        if remainder and row_layout:
+            for _ in range(COLS - remainder):
+                spacer = QWidget()
+                spacer.setFixedSize(THUMB, THUMB + 36)
+                spacer.setStyleSheet("background: transparent;")
+                row_layout.addWidget(spacer)
+
+        self._gallery_grid.addStretch()
+
     def _build_chat_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -1872,10 +2059,11 @@ if (obsData.length > 1) {{
             self._status_lbl.setText("No camera frame available")
             return
 
-        _play(_WAV_SCAN)  # ← scan beep
+        _play(_WAV_SCAN)
 
         frame = self._last_frame.copy()
         self._scan_btn.start_scanning()
+        self._cancel_btn.show()
         self._status_lbl.setText("Classifying + looking up species data...")
         if self._scan_overlay:
             self._scan_overlay.setGeometry(self._camera_label.geometry())
@@ -1891,14 +2079,33 @@ if (obsData.length > 1) {{
         self._analysis_worker.error_occurred.connect(self._on_error)
         self._analysis_worker.start()
 
+    def _on_cancel_scan(self):
+        """Cancel an in-progress scan cleanly."""
+        if self._analysis_worker and self._analysis_worker.isRunning():
+            self._analysis_worker.terminate()
+            self._analysis_worker.wait()
+        self._scan_btn.stop_scanning()
+        self._cancel_btn.hide()
+        if self._scan_overlay:
+            self._scan_overlay.stop()
+            self._scan_overlay.hide()
+        self._status_lbl.setText("Scan cancelled")
+
     def _on_result(self, result):
         self._scan_btn.stop_scanning()
+        self._cancel_btn.hide()
         self._status_lbl.setText(f"Identified: {result['name']}")
         if self._scan_overlay:
             self._scan_overlay.stop()
             self._scan_overlay.hide()
 
-        _play(_WAV_SUCCESS)  # ← success chord
+        _play(_WAV_SUCCESS)
+
+        # Save scan image permanently to ~/.naturedex_images/
+        saved_path = self._save_scan_image(result.get("image_path", ""),
+                                           result.get("timestamp", ""))
+        if saved_path:
+            result["saved_image_path"] = saved_path
 
         self._current_result = result
         self._chat_history   = []
@@ -1913,9 +2120,29 @@ if (obsData.length > 1) {{
         self._switch_tab(0)
         self._reset_chat()
         self._report_btn.setEnabled(True)
+        # Refresh gallery in background so it's ready when user navigates to it
+        QTimer.singleShot(500, self._refresh_gallery)
+
+    def _save_scan_image(self, tmp_path: str, timestamp: str) -> str:
+        """Copy the temp scan image to a permanent location.
+        Returns the saved path, or empty string on failure."""
+        try:
+            import shutil
+            images_dir = Path.home() / ".naturedex_images"
+            images_dir.mkdir(exist_ok=True)
+            # Use timestamp as filename so each scan is unique
+            safe_ts = timestamp.replace(":", "-").replace(".", "-")[:19]
+            dest = images_dir / f"scan_{safe_ts}.jpg"
+            if tmp_path and Path(tmp_path).exists():
+                shutil.copy2(tmp_path, dest)
+                return str(dest)
+        except Exception as e:
+            print(f"[Image save] {e}")
+        return ""
 
     def _on_error(self, msg):
         self._scan_btn.stop_scanning()
+        self._cancel_btn.hide()
         self._status_lbl.setText(f"Error: {msg}")
         if self._scan_overlay:
             self._scan_overlay.stop()
