@@ -15,6 +15,8 @@ import tempfile
 import math
 import urllib.request
 import urllib.parse
+import http.server
+import socket
 import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
@@ -82,6 +84,10 @@ C_SCREEN     = "#0f1409"
 C_SCAN_LINE  = C_ACCENT
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Cesium Ion token — only used for the star-field skybox assets, not imagery.
+# Imagery is served locally through the proxy below (no Ion dependency).
+CESIUM_TOKEN = os.getenv("CESIUM_ION_TOKEN", "")
 
 ACHIEVEMENTS = [
     # ── Discovery count ────────────────────────────────────────────────────────
@@ -225,8 +231,7 @@ def _nc_rarity_label(nc_count: int) -> str:
 
 
 def _fetch_observation_coords(taxon_id: int, max_obs: int = 80) -> list[dict]:
-    """Fetch research-grade observation coordinates for a taxon from iNaturalist.
-    Returns list of dicts with lat, lng, place_name, observed_on, quality."""
+    """Fetch research-grade observation coordinates for a taxon from iNaturalist."""
     if not taxon_id:
         return []
     try:
@@ -263,6 +268,39 @@ def _fetch_observation_coords(taxon_id: int, max_obs: int = 80) -> list[dict]:
     except Exception as e:
         print(f"[Map] Coord fetch error: {e}")
         return []
+
+
+# Cache so we only look up location once per session
+_user_location_cache: dict = {}
+
+def _get_user_location() -> dict:
+    """Get approximate user location using IP geolocation (ipinfo.io, free tier).
+    Returns dict with lat, lng, city, region, country or empty dict on failure.
+    Result is cached for the session so we only call the API once."""
+    if _user_location_cache:
+        return _user_location_cache.copy()
+    try:
+        req = urllib.request.Request(
+            "https://ipinfo.io/json",
+            headers={"User-Agent": "NatureDexAI/1.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        loc = data.get("loc", "")
+        if loc and "," in loc:
+            lat, lng = map(float, loc.split(","))
+            result = {
+                "lat":     lat,
+                "lng":     lng,
+                "city":    data.get("city", ""),
+                "region":  data.get("region", ""),
+                "country": data.get("country", ""),
+            }
+            _user_location_cache.update(result)
+            return result
+    except Exception as e:
+        print(f"[Location] {e}")
+    return {}
+
 
 # ─── Custom NC Model ──────────────────────────────────────────────────────────
 
@@ -439,6 +477,7 @@ class AnalysisWorker(QThread):
                 "phonetic":          phonetic,
                 "timestamp":         datetime.datetime.now().isoformat(),
                 "image_path":        tmp_path,
+                "scan_location":     _get_user_location(),
             })
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -603,6 +642,105 @@ class ChatWorker(QThread):
             )
         except Exception as e:
             self.reply_ready.emit(f"Error: {str(e)}")
+
+
+# ─── Map HTTP Server ──────────────────────────────────────────────────────────
+# Cesium needs an http:// origin (not file://) to resolve its built-in assets
+# and load tile imagery. We spin up a tiny single-file server on localhost that
+# also proxies Esri World Imagery + reference-label tiles (avoids all CORS/CDN
+# blocking inside QWebEngineView).
+
+_MAP_HTML_CONTENT = ""   # set each time before loading
+_MAP_SERVER_PORT  = None
+
+
+class _MapHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/map" or self.path == "/":
+            # Serve the map HTML
+            content = _MAP_HTML_CONTENT.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type",   "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content)
+
+        elif self.path.startswith("/tiles/"):
+            # Proxy tile requests to Esri World Imagery (satellite basemap).
+            # Path format: /tiles/{z}/{y}/{x}
+            try:
+                tile_path = self.path[len("/tiles/"):]
+                esri_url  = (f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+                             f"World_Imagery/MapServer/tile/{tile_path}")
+                req = urllib.request.Request(
+                    esri_url,
+                    headers={"User-Agent": "NatureDexAI/1.0",
+                             "Referer":    "https://server.arcgisonline.com"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                self.send_response(200)
+                self.send_header("Content-Type",   "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self.send_response(404)
+                self.end_headers()
+
+        elif self.path.startswith("/labels/"):
+            # Proxy Esri reference label tiles (place names + boundaries, PNG w/ alpha)
+            try:
+                tile_path = self.path[len("/labels/"):]
+                esri_url  = (f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+                             f"Reference/World_Boundaries_and_Places/MapServer/tile/{tile_path}")
+                req = urllib.request.Request(
+                    esri_url,
+                    headers={"User-Agent": "NatureDexAI/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                self.send_response(200)
+                self.send_header("Content-Type",   "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _get_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _ensure_map_server() -> int:
+    """Start the map server if not already running. Returns the port."""
+    global _MAP_SERVER_PORT
+    if _MAP_SERVER_PORT is not None:
+        return _MAP_SERVER_PORT
+    port = _get_free_port()
+
+    class _ThreadedServer(http.server.ThreadingHTTPServer):
+        pass
+
+    server = _ThreadedServer(("127.0.0.1", port), _MapHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    _MAP_SERVER_PORT = port
+    print(f"[Map server] Listening on http://127.0.0.1:{port}")
+    return port
 
 
 # ─── Boot Screen ──────────────────────────────────────────────────────────────
@@ -909,6 +1047,115 @@ class ToastNotification(QFrame):
         self._dismiss_timer.start(3000)
 
 
+class GalleryCard(QFrame):
+    """A thumbnail card in the scan gallery with a hover-reveal delete button."""
+    clicked_signal = pyqtSignal(dict)
+    delete_signal  = pyqtSignal(dict)   # emits entry dict so caller can remove image + entry
+
+    THUMB = 120
+
+    def __init__(self, entry: dict, parent=None):
+        super().__init__(parent)
+        self._entry = entry
+        self.setFixedSize(self.THUMB, self.THUMB + 36)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {C_CARD};
+                border-radius: 8px;
+                border: none;
+            }}
+            QFrame:hover {{
+                background: #254225;
+                border: 1px solid {C_ACCENT};
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Image container — stacked so delete button overlays it
+        img_container = QWidget()
+        img_container.setFixedSize(self.THUMB, self.THUMB)
+        img_container.setStyleSheet("background: transparent;")
+
+        self._img_lbl = QLabel(img_container)
+        self._img_lbl.setFixedSize(self.THUMB, self.THUMB)
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setStyleSheet("border-radius: 8px 8px 0 0; background: #000;")
+        try:
+            path = entry.get("saved_image_path", "")
+            if path and Path(path).exists():
+                px = QPixmap(path)
+                if not px.isNull():
+                    px = px.scaled(self.THUMB, self.THUMB,
+                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+                    if px.width() > self.THUMB or px.height() > self.THUMB:
+                        x = (px.width()  - self.THUMB) // 2
+                        y = (px.height() - self.THUMB) // 2
+                        px = px.copy(x, y, self.THUMB, self.THUMB)
+                    self._img_lbl.setPixmap(px)
+                else:
+                    self._img_lbl.setText("📷")
+            else:
+                self._img_lbl.setText("📷")
+        except Exception:
+            self._img_lbl.setText("📷")
+
+        # Delete button — top-right corner of image, hidden until hover
+        self._del_btn = QPushButton("✕", img_container)
+        self._del_btn.setFixedSize(22, 22)
+        self._del_btn.move(self.THUMB - 26, 4)
+        self._del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._del_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(26,31,20,0.85);
+                color: {C_SUBTEXT};
+                border: 1px solid {C_BORDER};
+                border-radius: 11px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: {C_RED};
+                color: white;
+                border-color: {C_RED};
+            }}
+        """)
+        self._del_btn.hide()
+        self._del_btn.clicked.connect(lambda: self.delete_signal.emit(self._entry))
+
+        layout.addWidget(img_container)
+
+        name_lbl = QLabel(entry.get("name", "Unknown")[:14])
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_lbl.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 9px; font-weight: 600; padding: 4px 4px 2px 4px;")
+        date_lbl = QLabel(entry.get("timestamp", "")[:10])
+        date_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        date_lbl.setStyleSheet(
+            f"color: {C_SUBTEXT}; font-size: 8px; padding: 0 4px 4px 4px;")
+        layout.addWidget(name_lbl)
+        layout.addWidget(date_lbl)
+
+    def enterEvent(self, event):
+        self._del_btn.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._del_btn.hide()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        # Don't fire click if delete button was pressed
+        if self._del_btn.geometry().contains(event.pos()):
+            return
+        self.clicked_signal.emit(self._entry)
+
+
 class CollectionCard(QFrame):
     clicked_signal = pyqtSignal(dict)
     delete_signal  = pyqtSignal(str)
@@ -1028,6 +1275,7 @@ class NatureDexWindow(QMainWindow):
         self._chat_history          = []
         self._camera_thread         = None
         self._analysis_worker       = None
+        self._scan_cancelled        = False  # set True on cancel, checked in _on_result
         self._last_frame            = None
         self._scan_overlay          = None
         self._toast                 = None
@@ -1054,6 +1302,7 @@ class NatureDexWindow(QMainWindow):
         self._start_camera()
         self.model_status_signal.connect(self._on_model_status)
         self.map_html_signal.connect(self._on_map_html)
+        _ensure_map_server()  # start early so port is known before first scan
         self._load_models_async()
 
         self._toast = ToastNotification(self)
@@ -1544,11 +1793,16 @@ class NatureDexWindow(QMainWindow):
 
         if _HAS_WEBENGINE:
             self._map_view = QWebEngineView()
-            self._map_view.settings().setAttribute(
-                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            s = self._map_view.settings()
+            # Allow the localhost-served page to load remote CDN scripts (Cesium)
+            s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+            s.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+            s.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
             self._map_view.setStyleSheet(f"background: {C_BG};")
             layout.addWidget(self._map_view)
-            # Show placeholder until a scan is done
             self._map_view.setHtml(self._map_placeholder_html())
         else:
             # Fallback if WebEngine not available
@@ -1570,201 +1824,211 @@ class NatureDexWindow(QMainWindow):
             </div></body></html>"""
 
     def _update_map(self, result: dict):
-        """Build and load a Leaflet.js map for the current result.
-        Fetches iNaturalist observation coordinates in a background thread
-        and emits map_html_signal when done — safe cross-thread UI update."""
+        """Build and load the CesiumJS 3D globe for the current result."""
         if not _HAS_WEBENGINE or not self._map_view:
             return
 
-        taxon_id = result.get("inat", {}).get("taxon_id")
-        name     = result.get("name", "Unknown")
-        sci      = result.get("entry", {}).get("scientific_name", "")
-        rarity   = result.get("rarity", "")
+        taxon_id      = result.get("inat", {}).get("taxon_id")
+        name          = result.get("name", "Unknown")
+        sci           = result.get("entry", {}).get("scientific_name", "")
+        rarity        = result.get("rarity", "")
+        scan_location = result.get("scan_location", {})
 
-        # Show loading state immediately (we're on main thread here)
         self._map_view.setHtml(f"""<!DOCTYPE html><html>
 <body style="margin:0;background:{C_BG};display:flex;align-items:center;
-justify-content:center;height:100vh;font-family:sans-serif;color:{C_SUBTEXT};font-size:14px;">
+justify-content:center;height:100vh;font-family:sans-serif;
+color:{C_SUBTEXT};font-size:14px;">
 <div style="text-align:center">
-    <div style="font-size:32px;margin-bottom:12px">🔍</div>
-    <div>Loading observation data for <b style="color:{C_TEXT}">{name}</b>...</div>
+    <div style="font-size:32px;margin-bottom:12px">🌍</div>
+    <div>Loading globe for <b style="color:{C_TEXT}">{name}</b>...</div>
 </div></body></html>""")
 
         def _fetch():
             coords = _fetch_observation_coords(taxon_id) if taxon_id else []
-            html   = self._build_map_html(name, sci, rarity, coords)
-            # Emit signal — safely crosses thread boundary to main Qt thread
+            html   = self._build_map_html(name, sci, rarity, coords, scan_location)
             self.map_html_signal.emit(html)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _on_map_html(self, html: str):
-        """Slot — always runs on main Qt thread. Loads the map HTML."""
-        if self._map_view:
-            self._map_view.setHtml(html)
+        """Slot — always runs on main Qt thread.
+        Serve the map HTML via the localhost HTTP server so Cesium gets a proper
+        http:// origin and can load its skybox assets + our proxied tile imagery."""
+        global _MAP_HTML_CONTENT
+        if not self._map_view:
+            return
+        _MAP_HTML_CONTENT = html
+        port = _ensure_map_server()
+        from PyQt6.QtCore import QUrl
+        self._map_view.setUrl(QUrl(f"http://127.0.0.1:{port}/map"))
 
-    def _build_map_html(self, name: str, sci: str, rarity: str,
-                        coords: list[dict]) -> str:
-        """Build a Leaflet.js map with dark tiles, clustered pins, and popups."""
-        if coords:
-            nc_coords = [c for c in coords if 33 < c["lat"] < 37 and -85 < c["lng"] < -75]
-            if nc_coords:
-                center_lat = sum(c["lat"] for c in nc_coords) / len(nc_coords)
-                center_lng = sum(c["lng"] for c in nc_coords) / len(nc_coords)
-                zoom = 7
-            else:
-                center_lat = sum(c["lat"] for c in coords) / len(coords)
-                center_lng = sum(c["lng"] for c in coords) / len(coords)
-                zoom = 4
-        else:
-            center_lat, center_lng, zoom = 35.5, -79.0, 6
+    # ── Globe Builder ──────────────────────────────────────────────────────────
+    # Realistic CesiumJS 3D globe. Key fixes vs. the old version:
+    #   • Imagery is attached AFTER viewer creation via imageryLayers
+    #     (Cesium 1.115 removed the constructor `imageryProvider` option — that
+    #      is why the old globe showed only a flat teal ellipsoid).
+    #   • Satellite basemap + place labels are served through our localhost proxy
+    #     (Esri World Imagery) so there are zero CORS / CDN issues in WebEngine.
+    #   • Adds ground + sky atmosphere, star-field skybox, subtle pin bloom,
+    #     a pulsing user-location pin, and gentle auto-rotation until interaction.
 
-        obs_js = json.dumps([{
-            "lat":   c["lat"],
-            "lng":   c["lng"],
-            "place": c.get("place", "Unknown location"),
-            "date":  c.get("observed_on", ""),
-        } for c in coords])
+    def _build_map_html(self, name, sci, rarity, coords, scan_location=None):
+        scan_location = scan_location or {}
+        port = _ensure_map_server()
+        base = "http://127.0.0.1:" + str(port)
 
-        rarity_color = {
-            "Very Rare in NC":  "#8e5fb5",
-            "Rare in NC":       "#c0392b",
-            "Uncommon in NC":   "#d4a017",
-            "Common in NC":     "#e8720c",
-            "Very Common in NC":"#6abf5e",
-        }.get(rarity, "#e8720c")
+        obs_js = json.dumps([{"lat": c["lat"], "lng": c["lng"],
+            "place": c.get("place", "Unknown"), "date": c.get("observed_on", "")}
+            for c in coords])
 
-        sci_html = (f'<div style="color:#7a9060;font-style:italic;font-size:11px;'
-                    f'margin-bottom:6px">{sci}</div>'
+        rc = {"Very Rare in NC": "#8e5fb5", "Rare in NC": "#c0392b",
+              "Uncommon in NC": "#d4a017", "Common in NC": "#e8720c",
+              "Very Common in NC": "#6abf5e"}.get(rarity, "#e8720c")
+        sci_html = ('<div style="color:#7a9060;font-style:italic;font-size:11px;margin-bottom:4px">' + sci + '</div>'
                     if sci and sci not in ("Unknown", "N/A", "") else "")
+        loc_dot = ('<br/><span class="dot" style="background:' + C_ACCENT + '"></span>Your location'
+                   if scan_location.get("lat") else "")
 
-        no_obs_html = (
-            '<div style="color:#7a9060;font-size:12px;margin-top:8px">'
-            'No iNaturalist observations found</div>'
-            if not coords else ""
-        )
+        # Camera centre + altitude
+        if scan_location.get("lat"):
+            cam_lon, cam_lat, cam_alt = scan_location["lng"], scan_location["lat"], 14000000
+        elif coords:
+            cam_lon = sum(c["lng"] for c in coords) / len(coords)
+            cam_lat = sum(c["lat"] for c in coords) / len(coords)
+            cam_alt = 20000000
+        else:
+            cam_lon, cam_lat, cam_alt = -79.0, 35.5, 20000000
 
-        return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<link rel="stylesheet"
-  href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
-<link rel="stylesheet"
-  href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-<style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{ background:{C_BG}; font-family:sans-serif; }}
-  #map {{ width:100%; height:100vh; }}
-  .leaflet-popup-content-wrapper {{
-    background: #1a1f14;
-    color: #f0ead8;
-    border: 1px solid #3a4a2a;
-    border-radius: 8px;
-    font-size: 12px;
-  }}
-  .leaflet-popup-tip {{ background: #1a1f14; }}
-  .leaflet-popup-close-button {{ color: #7a9060 !important; }}
-  .obs-popup-place {{ font-weight:700; color:#f0ead8; }}
-  .obs-popup-date  {{ color:#7a9060; font-size:11px; margin-top:2px; }}
-  .legend {{
-    position:fixed; bottom:16px; right:16px;
-    background:rgba(26,31,20,0.95);
-    border:1px solid #3a4a2a;
-    border-radius:8px;
-    padding:12px 16px;
-    color:#f0ead8;
-    font-size:11px;
-    line-height:2;
-    z-index:1000;
-    max-width:220px;
-  }}
-  .legend-name {{
-    font-size:13px; font-weight:800;
-    color:#f0ead8; display:block; margin-bottom:2px;
-  }}
-  .marker-cluster-small,
-  .marker-cluster-medium,
-  .marker-cluster-large {{
-    background-color: rgba(106,191,94,0.3) !important;
-  }}
-  .marker-cluster-small div,
-  .marker-cluster-medium div,
-  .marker-cluster-large div {{
-    background-color: rgba(106,191,94,0.7) !important;
-    color: #1a1f14 !important;
-    font-weight: 700;
-  }}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<div class="legend">
-  <span class="legend-name">{name}</span>
-  {sci_html}
-  <span style="color:{rarity_color}">◈ {rarity}</span><br/>
-  <span style="display:inline-block;width:10px;height:10px;border-radius:50%;
-    background:#6abf5e;margin-right:6px;vertical-align:middle"></span>
-  {len(coords)} iNaturalist observations
-  {no_obs_html}
-</div>
-<script>
-var map = L.map('map', {{
-    center: [{center_lat}, {center_lng}],
-    zoom: {zoom}
-}});
+        # Pulsing user-location pin
+        user_js = ""
+        if scan_location.get("lat"):
+            city  = scan_location.get("city", "")
+            state = scan_location.get("region", "")
+            label = (city + ", " + state) if city else "Your scan location"
+            ulat, ulng = scan_location["lat"], scan_location["lng"]
+            user_js = (
+                "var _t0=viewer.clock.currentTime;"
+                "viewer.entities.add({"
+                "position:Cesium.Cartesian3.fromDegrees(" + str(ulng) + "," + str(ulat) + "),"
+                "point:{pixelSize:new Cesium.CallbackProperty(function(time){"
+                "  var s=Cesium.JulianDate.secondsDifference(time,_t0);"
+                "  return 13+4*Math.sin(s*3.0);},false),"
+                "color:Cesium.Color.fromCssColorString('" + C_ACCENT + "'),"
+                "outlineColor:Cesium.Color.WHITE,outlineWidth:2,"
+                "heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,"
+                "disableDepthTestDistance:Number.POSITIVE_INFINITY},"
+                "label:{text:'" + label + "',font:'bold 13px sans-serif',"
+                "fillColor:Cesium.Color.fromCssColorString('" + C_TEXT + "'),"
+                "outlineColor:Cesium.Color.fromCssColorString('" + C_BG + "'),"
+                "outlineWidth:3,style:Cesium.LabelStyle.FILL_AND_OUTLINE,"
+                "pixelOffset:new Cesium.Cartesian2(0,-22),"
+                "disableDepthTestDistance:Number.POSITIVE_INFINITY},"
+                "description:'<p>Your scan location: " + label + "</p>',"
+                "});"
+            )
 
-// Dark basemap tiles
-L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
-    attribution: '&copy; OpenStreetMap &copy; CARTO',
-    subdomains: 'abcd',
-    maxZoom: 18
-}}).addTo(map);
+        cver = "1.115"
+        cbase = "https://cesium.com/downloads/cesiumjs/releases/" + cver + "/Build/Cesium/"
 
-var obsData = {obs_js};
-
-// Marker cluster group
-var markers = L.markerClusterGroup({{
-    maxClusterRadius: 40,
-    showCoverageOnHover: false,
-}});
-
-obsData.forEach(function(obs) {{
-    var circle = L.circleMarker([obs.lat, obs.lng], {{
-        radius: 6,
-        fillColor: '#6abf5e',
-        color: '#1a1f14',
-        weight: 1.5,
-        opacity: 1,
-        fillOpacity: 0.85
-    }});
-    var popup = '<div class="obs-popup-place">'
-        + (obs.place || 'Unknown location')
-        + '</div>'
-        + (obs.date
-            ? '<div class="obs-popup-date">Observed: ' + obs.date + '</div>'
-            : '');
-    circle.bindPopup(popup);
-    markers.addLayer(circle);
-}});
-
-map.addLayer(markers);
-
-if (obsData.length > 1) {{
-    var lats = obsData.map(function(o){{return o.lat;}});
-    var lngs = obsData.map(function(o){{return o.lng;}});
-    var pad = 1.0;
-    map.fitBounds([
-        [Math.min.apply(null,lats)-pad, Math.min.apply(null,lngs)-pad],
-        [Math.max.apply(null,lats)+pad, Math.max.apply(null,lngs)+pad]
-    ]);
-}}
-</script>
-</body>
-</html>"""
+        L = []
+        L.append("<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>")
+        L.append("<script>window.CESIUM_BASE_URL='" + cbase + "';</script>")
+        L.append("<script src=\"" + cbase + "Cesium.js\"></script>")
+        L.append("<link href=\"" + cbase + "Widgets/widgets.css\" rel=\"stylesheet\"/>")
+        L.append("<style>*{margin:0;padding:0;box-sizing:border-box}")
+        L.append("html,body,#c{width:100%;height:100%;overflow:hidden;background:#000}")
+        L.append(".cesium-widget-credits,.cesium-credit-logoContainer{display:none!important}")
+        L.append(".lg{position:fixed;top:14px;right:14px;background:rgba(26,31,20,.92);"
+                 "border:1px solid " + C_BORDER + ";border-radius:10px;padding:12px 16px;"
+                 "color:" + C_TEXT + ";font-size:11px;line-height:1.9;z-index:1000;"
+                 "max-width:230px;font-family:sans-serif}")
+        L.append(".nm{font-size:14px;font-weight:800;color:" + C_TEXT + ";display:block;margin-bottom:3px}")
+        L.append(".dot{display:inline-block;width:10px;height:10px;border-radius:50%;"
+                 "margin-right:6px;vertical-align:middle}")
+        L.append(".hint{position:fixed;bottom:12px;left:14px;color:" + C_SUBTEXT + ";"
+                 "font-size:10px;font-family:sans-serif;z-index:1000;opacity:.75}</style>")
+        L.append("</head><body>")
+        L.append("<div id=\"c\"></div>")
+        L.append("<div class=\"lg\">")
+        L.append("  <span class=\"nm\">" + name + "</span>" + sci_html)
+        L.append("  <span style=\"color:" + rc + "\">\u25c8 " + (rarity or "\u2014") + "</span><br/>")
+        L.append("  <span class=\"dot\" style=\"background:#6abf5e\"></span>" +
+                 str(len(coords)) + " iNaturalist obs" + loc_dot)
+        L.append("</div>")
+        L.append("<div class=\"hint\">Drag to rotate \u00b7 scroll to zoom \u00b7 click a dot for details</div>")
+        L.append("<script>")
+        if CESIUM_TOKEN:
+            L.append("Cesium.Ion.defaultAccessToken='" + CESIUM_TOKEN + "';")
+        # Viewer WITHOUT constructor imagery (that option was removed in 1.115).
+        L.append("var viewer=new Cesium.Viewer('c',{")
+        L.append("  baseLayer:false,")
+        L.append("  baseLayerPicker:false,geocoder:false,homeButton:false,")
+        L.append("  sceneModePicker:false,navigationHelpButton:false,")
+        L.append("  animation:false,timeline:false,fullscreenButton:false,")
+        L.append("  infoBox:true,selectionIndicator:true,")
+        L.append("  contextOptions:{webgl:{alpha:false}},")
+        L.append("});")
+        L.append("var scene=viewer.scene;")
+        # Realistic satellite basemap via local proxy (Esri World Imagery)
+        L.append("viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({")
+        L.append("  url:'" + base + "/tiles/{z}/{y}/{x}',")
+        L.append("  tilingScheme:new Cesium.WebMercatorTilingScheme(),")
+        L.append("  minimumLevel:0,maximumLevel:18,")
+        L.append("  credit:'Esri, Maxar, Earthstar Geographics'")
+        L.append("}));")
+        # Semi-transparent place-name / boundary label overlay
+        L.append("var _lbl=viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({")
+        L.append("  url:'" + base + "/labels/{z}/{y}/{x}',")
+        L.append("  tilingScheme:new Cesium.WebMercatorTilingScheme(),")
+        L.append("  minimumLevel:0,maximumLevel:18")
+        L.append("}));")
+        L.append("_lbl.alpha=0.8;")
+        # Atmosphere / lighting / stars for realism
+        L.append("scene.globe.showGroundAtmosphere=true;")
+        L.append("scene.globe.enableLighting=false;")
+        L.append("scene.globe.baseColor=Cesium.Color.fromCssColorString('#0a1626');")
+        L.append("scene.backgroundColor=Cesium.Color.BLACK;")
+        L.append("scene.skyAtmosphere.show=true;")
+        L.append("try{scene.skyAtmosphere.atmosphereLightIntensity=12.0;}catch(e){}")
+        L.append("scene.skyBox.show=true;")
+        L.append("scene.sun.show=true;")
+        L.append("scene.moon.show=false;")
+        L.append("scene.fog.enabled=true;")
+        L.append("scene.highDynamicRange=true;")
+        # Subtle bloom so the observation dots glow against the Earth
+        L.append("try{var bl=scene.postProcessStages.bloom;bl.enabled=true;")
+        L.append("bl.uniforms.glowOnly=false;bl.uniforms.contrast=118;")
+        L.append("bl.uniforms.brightness=-0.45;bl.uniforms.delta=1.2;")
+        L.append("bl.uniforms.sigma=2.2;bl.uniforms.stepSize=1.0;}catch(e){}")
+        # Observation pins
+        L.append("var obsData=" + obs_js + ";")
+        L.append("obsData.forEach(function(obs){")
+        L.append("  viewer.entities.add({")
+        L.append("    position:Cesium.Cartesian3.fromDegrees(obs.lng,obs.lat),")
+        L.append("    point:{pixelSize:8,color:Cesium.Color.fromCssColorString('#7CFF6B').withAlpha(0.92),")
+        L.append("      outlineColor:Cesium.Color.fromCssColorString('#0a1a06'),outlineWidth:1.5,")
+        L.append("      heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,")
+        L.append("      disableDepthTestDistance:Number.POSITIVE_INFINITY},")
+        L.append("    description:'<p style=\"color:#111\">'+obs.place+'<br/>'+obs.date+'</p>',")
+        L.append("  });")
+        L.append("});")
+        L.append(user_js)
+        # Initial framed view
+        L.append("viewer.camera.setView({")
+        L.append("  destination:Cesium.Cartesian3.fromDegrees(" +
+                 str(cam_lon) + "," + str(cam_lat) + "," + str(cam_alt) + "),")
+        L.append("  orientation:{heading:0.0,pitch:Cesium.Math.toRadians(-90),roll:0.0},")
+        L.append("});")
+        # Gentle auto-rotation until the user interacts
+        L.append("var _spin=true;")
+        L.append("scene.preRender.addEventListener(function(){")
+        L.append("  if(_spin){viewer.camera.rotate(Cesium.Cartesian3.UNIT_Z,-0.0008);}")
+        L.append("});")
+        L.append("['pointerdown','wheel','touchstart'].forEach(function(ev){")
+        L.append("  scene.canvas.addEventListener(ev,function(){_spin=false;});")
+        L.append("});")
+        L.append("</script></body></html>")
+        return "\n".join(L)
 
     def _build_gallery_tab(self):
         widget = QWidget()
@@ -1840,7 +2104,7 @@ if (obsData.length > 1) {{
 
         # Build rows of 3 thumbnails
         COLS = 3
-        THUMB = 120
+        THUMB = GalleryCard.THUMB
 
         row_widget = None
         row_layout = None
@@ -1855,64 +2119,10 @@ if (obsData.length > 1) {{
                 self._gallery_grid.addWidget(row_widget)
 
             # Thumbnail card
-            card = QFrame()
-            card.setFixedSize(THUMB, THUMB + 36)
-            card.setCursor(Qt.CursorShape.PointingHandCursor)
-            card.setStyleSheet(f"""
-                QFrame {{
-                    background: {C_CARD};
-                    border-radius: 8px;
-                    border: none;
-                }}
-                QFrame:hover {{
-                    background: #254225;
-                    border: 1px solid {C_ACCENT};
-                }}
-            """)
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(0, 0, 0, 0)
-            card_layout.setSpacing(0)
-
-            # Thumbnail image
-            img_lbl = QLabel()
-            img_lbl.setFixedSize(THUMB, THUMB)
-            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img_lbl.setStyleSheet("border-radius: 8px 8px 0 0; background: #000;")
-            try:
-                px = QPixmap(entry["saved_image_path"])
-                if not px.isNull():
-                    px = px.scaled(THUMB, THUMB,
-                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                   Qt.TransformationMode.SmoothTransformation)
-                    # Center-crop
-                    if px.width() > THUMB or px.height() > THUMB:
-                        x = (px.width()  - THUMB) // 2
-                        y = (px.height() - THUMB) // 2
-                        px = px.copy(x, y, THUMB, THUMB)
-                    img_lbl.setPixmap(px)
-            except Exception:
-                img_lbl.setText("📷")
-            card_layout.addWidget(img_lbl)
-
-            # Species name label
-            name_lbl = QLabel(entry.get("name", "Unknown")[:14])
-            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            name_lbl.setStyleSheet(
-                f"color: {C_TEXT}; font-size: 9px; font-weight: 600; padding: 4px 4px 2px 4px;")
-            date_lbl = QLabel(entry.get("timestamp", "")[:10])
-            date_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            date_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 8px; padding: 0 4px 4px 4px;")
-            card_layout.addWidget(name_lbl)
-            card_layout.addWidget(date_lbl)
-
-            # Click to load entry
-            def make_click(e):
-                def handler(ev):
-                    self._on_collection_click(e)
-                    self._switch_tab(0)
-                return handler
-            card.mousePressEvent = make_click(entry)
-
+            card = GalleryCard(entry)
+            card.clicked_signal.connect(lambda e: (self._on_collection_click(e),
+                                                    self._switch_tab(0)))
+            card.delete_signal.connect(self._on_gallery_delete)
             row_layout.addWidget(card)
 
         # Pad last row if needed
@@ -1925,6 +2135,30 @@ if (obsData.length > 1) {{
                 row_layout.addWidget(spacer)
 
         self._gallery_grid.addStretch()
+
+    def _on_gallery_delete(self, entry: dict):
+        """Delete a scan image and remove saved_image_path from the collection."""
+        ts = entry.get("timestamp", "")
+        if not ts:
+            return
+
+        # Delete the image file
+        img_path = entry.get("saved_image_path", "")
+        if img_path:
+            try:
+                Path(img_path).unlink(missing_ok=True)
+            except Exception as e:
+                print(f"[Gallery delete] {e}")
+
+        # Remove saved_image_path from collection entry (keep the entry itself)
+        for e in self._collection:
+            if e.get("timestamp") == ts:
+                e.pop("saved_image_path", None)
+                break
+        self._save_collection()
+
+        # Refresh the gallery to reflect the deletion
+        self._refresh_gallery()
 
     def _build_chat_tab(self):
         widget = QWidget()
@@ -2060,7 +2294,7 @@ if (obsData.length > 1) {{
             return
 
         _play(_WAV_SCAN)
-
+        self._scan_cancelled = False  # reset for new scan
         frame = self._last_frame.copy()
         self._scan_btn.start_scanning()
         self._cancel_btn.show()
@@ -2080,10 +2314,12 @@ if (obsData.length > 1) {{
         self._analysis_worker.start()
 
     def _on_cancel_scan(self):
-        """Cancel an in-progress scan cleanly."""
-        if self._analysis_worker and self._analysis_worker.isRunning():
-            self._analysis_worker.terminate()
-            self._analysis_worker.wait()
+        """Cancel an in-progress scan safely.
+        We NEVER call terminate() on AnalysisWorker — it runs TensorFlow/PyTorch
+        inference in C++ native code and terminating mid-inference causes a segfault.
+        Instead we set a flag so the result is silently discarded when it arrives."""
+        self._scan_cancelled = True
+        # Don't touch the worker thread — let it finish naturally
         self._scan_btn.stop_scanning()
         self._cancel_btn.hide()
         if self._scan_overlay:
@@ -2092,6 +2328,11 @@ if (obsData.length > 1) {{
         self._status_lbl.setText("Scan cancelled")
 
     def _on_result(self, result):
+        # If user cancelled while the worker was finishing, discard the result
+        if self._scan_cancelled:
+            self._scan_cancelled = False
+            return
+
         self._scan_btn.stop_scanning()
         self._cancel_btn.hide()
         self._status_lbl.setText(f"Identified: {result['name']}")
@@ -2141,6 +2382,9 @@ if (obsData.length > 1) {{
         return ""
 
     def _on_error(self, msg):
+        if self._scan_cancelled:
+            self._scan_cancelled = False
+            return
         self._scan_btn.stop_scanning()
         self._cancel_btn.hide()
         self._status_lbl.setText(f"Error: {msg}")
@@ -2947,6 +3191,10 @@ If asked about North Carolina specifically, provide NC-relevant context."""
 # ─── Entry Point ───────────────────────────────────────────────────────────────
 
 def main():
+    # Enable WebGL and hardware acceleration for CesiumJS globe rendering
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                          "--enable-unsafe-webgpu --ignore-gpu-blocklist "
+                          "--enable-gpu-rasterization --use-angle=metal")
     app = QApplication(sys.argv)
     app.setApplicationName("NatureDex AI")
     win = NatureDexWindow()
