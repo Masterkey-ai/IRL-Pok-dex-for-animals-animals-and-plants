@@ -2038,6 +2038,7 @@ color:{C_SUBTEXT};font-size:14px;">
             user_js = (
                 "var _t0=viewer.clock.currentTime;"
                 "viewer.entities.add({"
+                "name:'Your Scan Location',"
                 "position:Cesium.Cartesian3.fromDegrees(" + str(ulng) + "," + str(ulat) + "),"
                 "point:{pixelSize:new Cesium.CallbackProperty(function(time){"
                 "  var s=Cesium.JulianDate.secondsDifference(time,_t0);"
@@ -2052,7 +2053,9 @@ color:{C_SUBTEXT};font-size:14px;">
                 "outlineWidth:3,style:Cesium.LabelStyle.FILL_AND_OUTLINE,"
                 "pixelOffset:new Cesium.Cartesian2(0,-22),"
                 "disableDepthTestDistance:Number.POSITIVE_INFINITY},"
-                "description:'<p>Your scan location: " + label + "</p>',"
+                "description:'<div style=\"color:#f0ead8;font-family:sans-serif;"
+                "font-size:14px;line-height:1.6;padding:4px 2px\">Your scan location:<br/>"
+                "<span style=\"font-weight:700;color:#e8720c\">" + label + "</span></div>',"
                 "});"
             )
 
@@ -2133,12 +2136,16 @@ color:{C_SUBTEXT};font-size:14px;">
         L.append("var obsData=" + obs_js + ";")
         L.append("obsData.forEach(function(obs){")
         L.append("  viewer.entities.add({")
+        L.append("    name:'iNaturalist Observation',")
         L.append("    position:Cesium.Cartesian3.fromDegrees(obs.lng,obs.lat),")
         L.append("    point:{pixelSize:8,color:Cesium.Color.fromCssColorString('#7CFF6B').withAlpha(0.92),")
         L.append("      outlineColor:Cesium.Color.fromCssColorString('#0a1a06'),outlineWidth:1.5,")
         L.append("      heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,")
         L.append("      disableDepthTestDistance:Number.POSITIVE_INFINITY},")
-        L.append("    description:'<p style=\"color:#111\">'+obs.place+'<br/>'+obs.date+'</p>',")
+        L.append("    description:'<div style=\"color:#f0ead8;font-family:sans-serif;"
+                 "font-size:14px;line-height:1.6;padding:4px 2px\">"
+                 "<div style=\"font-weight:700;color:#7CFF6B;margin-bottom:4px\">'+obs.place+'</div>"
+                 "<div style=\"color:#b9c6a5\">Observed: '+obs.date+'</div></div>',")
         L.append("  });")
         L.append("});")
         L.append(user_js)
