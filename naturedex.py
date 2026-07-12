@@ -65,6 +65,8 @@ _SCRIPT_DIR           = Path(__file__).parent
 CUSTOM_MODEL_PTH      = _SCRIPT_DIR / "models" / "naturedex_nc_v1.pth"
 CUSTOM_MODEL_THRESHOLD = 60.0
 
+INVASIVE_REPORTS_FILE = Path.home() / ".naturedex_invasive_reports.json"
+
 C_BG         = "#1a1f14"
 C_PANEL      = "#222918"
 C_CARD       = "#2a3320"
@@ -228,6 +230,127 @@ def _nc_rarity_label(nc_count: int) -> str:
     elif nc_count < 1000:  return "Uncommon in NC"
     elif nc_count < 10000: return "Common in NC"
     else:                  return "Very Common in NC"
+
+
+# ─── Invasive Species (North Carolina) ────────────────────────────────────────
+# A curated list of species that are invasive / of concern in North Carolina.
+# "severity" drives the banner color:
+#   "Emerging Threat" (red)  — report immediately, limited spread, high priority
+#   "Established"     (orange)— widespread, still worth documenting
+#   "Watch"           (yellow)— monitor / coastal / localized
+# "report_to" tells the user the correct real-world reporting channel.
+
+_EDDMAPS   = "Report at EDDMapS.org or the EDDMapS mobile app"
+_NCDA_PEST = "Report to NCDA&CS Plant Industry: 1-800-206-9333 / newpest@ncagr.gov"
+_NCWRC     = "Report to the NC Wildlife Resources Commission (ncwildlife.org)"
+
+NC_INVASIVE_SPECIES = [
+    # ── Insects / pests (highest priority — emerging or destructive) ──────────
+    {"common": "Spotted Lanternfly", "scientific_name": "Lycorma delicatula",
+     "type": "Insect", "severity": "Emerging Threat", "report_to": _NCDA_PEST,
+     "why": "A planthopper that damages grapevines, fruit trees, and hardwoods. NC is actively tracking its spread — early reports matter.",
+     "match_keywords": ["spotted lanternfly", "lanternfly", "lycorma"]},
+    {"common": "Emerald Ash Borer", "scientific_name": "Agrilus planipennis",
+     "type": "Insect", "severity": "Emerging Threat", "report_to": _NCDA_PEST,
+     "why": "A metallic-green beetle whose larvae have killed millions of ash trees. Look for D-shaped exit holes and canopy dieback.",
+     "match_keywords": ["emerald ash borer", "agrilus planipennis"]},
+    {"common": "Asian Longhorned Beetle", "scientific_name": "Anoplophora glabripennis",
+     "type": "Insect", "severity": "Emerging Threat", "report_to": _NCDA_PEST,
+     "why": "A large black-and-white beetle that bores into hardwoods. Not yet established in NC — sightings are urgent.",
+     "match_keywords": ["asian longhorned beetle", "longhorned beetle", "anoplophora"]},
+    {"common": "Hemlock Woolly Adelgid", "scientific_name": "Adelges tsugae",
+     "type": "Insect", "severity": "Established", "report_to": _NCDA_PEST,
+     "why": "Tiny sap-feeding insect (white woolly masses on hemlock needles) devastating NC's mountain hemlock forests.",
+     "match_keywords": ["hemlock woolly adelgid", "woolly adelgid", "adelges"]},
+    {"common": "Brown Marmorated Stink Bug", "scientific_name": "Halyomorpha halys",
+     "type": "Insect", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "An agricultural pest that damages crops and invades homes in fall. Widespread across NC.",
+     "match_keywords": ["brown marmorated stink bug", "marmorated stink bug", "halyomorpha"]},
+
+    # ── Aquatic / coastal ─────────────────────────────────────────────────────
+    {"common": "Red Lionfish", "scientific_name": "Pterois volitans",
+     "type": "Fish", "severity": "Established", "report_to": _NCWRC,
+     "why": "A venomous Indo-Pacific reef fish now off the NC coast. Preys on native reef species and has no natural predators here.",
+     "match_keywords": ["lionfish", "pterois"]},
+    {"common": "Northern Snakehead", "scientific_name": "Channa argus",
+     "type": "Fish", "severity": "Emerging Threat", "report_to": _NCWRC,
+     "why": "A predatory air-breathing fish that can survive out of water. Do NOT release it — report and remove.",
+     "match_keywords": ["snakehead", "channa"]},
+    {"common": "Nutria", "scientific_name": "Myocastor coypus",
+     "type": "Mammal", "severity": "Established", "report_to": _NCWRC,
+     "why": "A large semi-aquatic rodent that destroys wetland vegetation and erodes marsh banks.",
+     "match_keywords": ["nutria", "coypu", "myocastor"]},
+    {"common": "Feral Hog", "scientific_name": "Sus scrofa",
+     "type": "Mammal", "severity": "Established", "report_to": _NCWRC,
+     "why": "Wild pigs root up soil, destroy crops, and spread disease. A major problem across NC.",
+     "match_keywords": ["feral hog", "wild boar", "feral pig", "wild pig"]},
+
+    # ── Plants (widespread, still valuable to map) ────────────────────────────
+    {"common": "Japanese Stiltgrass", "scientific_name": "Microstegium vimineum",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A fast-spreading annual grass that carpets forest floors and crowds out native plants.",
+     "match_keywords": ["stiltgrass", "microstegium"]},
+    {"common": "Kudzu", "scientific_name": "Pueraria montana",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "\"The vine that ate the South\" — smothers trees and structures, growing up to a foot per day.",
+     "match_keywords": ["kudzu", "pueraria"]},
+    {"common": "Tree of Heaven", "scientific_name": "Ailanthus altissima",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A fast-growing tree that crowds out natives and is the preferred host of the spotted lanternfly.",
+     "match_keywords": ["tree of heaven", "ailanthus"]},
+    {"common": "Chinese Privet", "scientific_name": "Ligustrum sinense",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A shrub that forms dense thickets along streams and forest edges, shading out native seedlings.",
+     "match_keywords": ["chinese privet", "ligustrum"]},
+    {"common": "Autumn Olive", "scientific_name": "Elaeagnus umbellata",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A shrub with silvery leaves and red berries that spreads aggressively into fields and roadsides.",
+     "match_keywords": ["autumn olive", "elaeagnus"]},
+    {"common": "Multiflora Rose", "scientific_name": "Rosa multiflora",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A thorny shrub forming impenetrable thickets in pastures and woodlands.",
+     "match_keywords": ["multiflora rose"]},
+    {"common": "Oriental Bittersweet", "scientific_name": "Celastrus orbiculatus",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A woody vine that girdles and topples trees under its weight.",
+     "match_keywords": ["oriental bittersweet", "celastrus"]},
+    {"common": "Japanese Honeysuckle", "scientific_name": "Lonicera japonica",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "A vine that blankets shrubs and forest edges, outcompeting native understory plants.",
+     "match_keywords": ["japanese honeysuckle"]},
+    {"common": "Callery (Bradford) Pear", "scientific_name": "Pyrus calleryana",
+     "type": "Plant", "severity": "Established", "report_to": _EDDMAPS,
+     "why": "An ornamental tree gone wild — forms dense thorny stands and displaces native trees.",
+     "match_keywords": ["callery pear", "bradford pear", "pyrus calleryana"]},
+    {"common": "Giant Hogweed", "scientific_name": "Heracleum mantegazzianum",
+     "type": "Plant", "severity": "Emerging Threat", "report_to": _NCDA_PEST,
+     "why": "Sap causes severe burns and blisters. Rare in NC — do NOT touch; report immediately.",
+     "match_keywords": ["giant hogweed", "heracleum"]},
+]
+
+
+def check_invasive(common_name: str, scientific_name: str, raw_label: str = "") -> dict:
+    """Return an invasive-species info dict if the scan matches a known NC invasive,
+    else {}. Matches on the full scientific binomial first (most reliable), then on
+    distinctive common-name keywords. Genus-only matching is deliberately avoided
+    to prevent false positives (e.g. a garden rose being flagged as multiflora rose)."""
+    sci = (scientific_name or "").strip().lower()
+    hay = " ".join([common_name or "", raw_label or "",
+                    scientific_name or ""]).lower()
+    for inv in NC_INVASIVE_SPECIES:
+        inv_sci = inv["scientific_name"].lower()
+        if sci and sci == inv_sci:
+            return inv
+        for kw in inv["match_keywords"]:
+            if kw in hay:
+                return inv
+    return {}
+
+
+def _invasive_severity_color(severity: str) -> str:
+    return {"Emerging Threat": C_RED,
+            "Established":      C_ACCENT,
+            "Watch":           C_YELLOW}.get(severity, C_ACCENT)
 
 
 def _fetch_observation_coords(taxon_id: int, max_obs: int = 80) -> list[dict]:
@@ -463,6 +586,11 @@ class AnalysisWorker(QThread):
                         if sci_name and sci_name not in ("Unknown", "N/A", "")
                         else "")
 
+            # Flag invasive species of concern in North Carolina
+            invasive = check_invasive(
+                inat_data.get("common_name") or label,
+                sci_name, raw_label)
+
             self.result_ready.emit({
                 "name":              inat_data.get("common_name") or label,
                 "raw_label":         raw_label,
@@ -475,6 +603,7 @@ class AnalysisWorker(QThread):
                 "model_source":      model_source,
                 "used_custom_model": used_custom,
                 "phonetic":          phonetic,
+                "invasive":          invasive,
                 "timestamp":         datetime.datetime.now().isoformat(),
                 "image_path":        tmp_path,
                 "scan_location":     _get_user_location(),
@@ -1938,9 +2067,9 @@ color:{C_SUBTEXT};font-size:14px;">
         L.append("<style>*{margin:0;padding:0;box-sizing:border-box}")
         L.append("html,body,#c{width:100%;height:100%;overflow:hidden;background:#000}")
         L.append(".cesium-widget-credits,.cesium-credit-logoContainer{display:none!important}")
-        L.append(".lg{position:fixed;top:14px;right:14px;background:rgba(26,31,20,.92);"
+        L.append(".lg{position:fixed;top:14px;left:14px;background:rgba(26,31,20,.92);"
                  "border:1px solid " + C_BORDER + ";border-radius:10px;padding:12px 16px;"
-                 "color:" + C_TEXT + ";font-size:11px;line-height:1.9;z-index:1000;"
+                 "color:" + C_TEXT + ";font-size:11px;line-height:1.9;z-index:900;"
                  "max-width:230px;font-family:sans-serif}")
         L.append(".nm{font-size:14px;font-weight:800;color:" + C_TEXT + ";display:block;margin-bottom:3px}")
         L.append(".dot{display:inline-block;width:10px;height:10px;border-radius:50%;"
@@ -2577,6 +2706,16 @@ color:{C_SUBTEXT};font-size:14px;">
         self._entry_inner.addWidget(name_frame)
         self._fade_in(name_frame, 0)           # ← fade in immediately
 
+        # ── Invasive species alert ────────────────────────────────────────────
+        inv = result.get("invasive")
+        if not inv:  # older scans (pre-feature) — detect on the fly
+            inv = check_invasive(result.get("name", ""), sci,
+                                 result.get("raw_label", ""))
+        if inv:
+            banner = self._make_invasive_banner(inv, result)
+            self._entry_inner.addWidget(banner)
+            self._fade_in(banner, 40)
+
         desc = entry.get("description", "")
         if desc:
             desc_lbl = QLabel(desc)
@@ -2660,6 +2799,134 @@ color:{C_SUBTEXT};font-size:14px;">
             self._fade_in(alt_frame, delay)
 
         self._entry_inner.addStretch()
+
+    def _make_invasive_banner(self, inv: dict, result: dict) -> QFrame:
+        """Build the prominent invasive-species alert card with a Report button."""
+        sev   = inv.get("severity", "Established")
+        color = _invasive_severity_color(sev)
+
+        banner = QFrame()
+        banner.setObjectName("invBanner")
+        banner.setStyleSheet(f"""
+            QFrame#invBanner {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {C_CARD}, stop:1 #2a1810);
+                border: 1px solid {color};
+                border-left: 4px solid {color};
+                border-radius: 8px;
+            }}
+        """)
+        v = QVBoxLayout(banner)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(7)
+
+        # Header row: warning icon + "INVASIVE SPECIES" + severity pill
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        icon = QLabel("⚠")
+        icon.setStyleSheet(f"color: {color}; font-size: 16px; font-weight: 900;")
+        head.addWidget(icon)
+        title = QLabel("INVASIVE SPECIES")
+        title.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: 900; letter-spacing: 2px;")
+        head.addWidget(title)
+        head.addStretch()
+        pill = QLabel(f"  {sev.upper()}  ")
+        pill.setStyleSheet(f"""
+            background: {color};
+            color: #14100a;
+            font-size: 9px;
+            font-weight: 800;
+            border-radius: 4px;
+            padding: 2px 6px;
+            letter-spacing: 1px;
+        """)
+        head.addWidget(pill)
+        v.addLayout(head)
+
+        # Why it matters
+        why = QLabel(inv.get("why", ""))
+        why.setWordWrap(True)
+        why.setStyleSheet(f"color: {C_TEXT}; font-size: 12px; line-height: 1.5;")
+        v.addWidget(why)
+
+        # Report row: button + channel guidance
+        report_row = QHBoxLayout()
+        report_row.setSpacing(10)
+
+        report_btn = QPushButton("⚑  Report This Sighting")
+        report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        report_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {color};
+                color: #14100a;
+                border: none;
+                border-radius: 7px;
+                padding: 7px 16px;
+                font-size: 12px;
+                font-weight: 800;
+                letter-spacing: 0.5px;
+            }}
+            QPushButton:hover {{ background: {C_TEXT}; }}
+        """)
+        report_btn.clicked.connect(
+            lambda _=False, i=inv, r=result, b=report_btn: self._on_report_invasive(i, r, b))
+        report_row.addWidget(report_btn)
+        report_row.addStretch()
+        v.addLayout(report_row)
+
+        # Where to report
+        chan = QLabel(inv.get("report_to", ""))
+        chan.setWordWrap(True)
+        chan.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px; font-style: italic;")
+        v.addWidget(chan)
+
+        return banner
+
+    def _on_report_invasive(self, inv: dict, result: dict, btn: QPushButton):
+        """Log an invasive-species report locally and confirm to the user."""
+        self._save_invasive_report(inv, result)
+        try:
+            btn.setText("✓  Sighting Reported — Thank You!")
+            btn.setEnabled(False)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C_GREEN};
+                    color: #14100a;
+                    border: none;
+                    border-radius: 7px;
+                    padding: 7px 16px;
+                    font-size: 12px;
+                    font-weight: 800;
+                }}
+            """)
+        except RuntimeError:
+            pass
+        # Fire a toast for that satisfying feedback in a demo
+        if self._toast:
+            self._toast.show_achievement("🛡️", "Invasive Species Reported")
+
+    def _save_invasive_report(self, inv: dict, result: dict):
+        record = {
+            "timestamp":       datetime.datetime.now().isoformat(),
+            "common_name":     inv.get("common", result.get("name", "")),
+            "scientific_name": inv.get("scientific_name", ""),
+            "severity":        inv.get("severity", ""),
+            "type":            inv.get("type", ""),
+            "report_to":       inv.get("report_to", ""),
+            "scan_location":   result.get("scan_location", {}),
+            "image_path":      result.get("saved_image_path")
+                               or result.get("image_path", ""),
+        }
+        try:
+            reports = []
+            if INVASIVE_REPORTS_FILE.exists():
+                reports = json.loads(INVASIVE_REPORTS_FILE.read_text())
+            reports.append(record)
+            INVASIVE_REPORTS_FILE.write_text(json.dumps(reports, indent=2))
+            print(f"[Invasive report] Logged: {record['common_name']}")
+        except Exception as e:
+            print(f"Could not save invasive report: {e}")
 
     def _make_info_card(self, label, value):
         card = QFrame()
