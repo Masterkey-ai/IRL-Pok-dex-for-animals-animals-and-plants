@@ -2140,8 +2140,7 @@ color:{C_SUBTEXT};font-size:14px;">
         L.append("    position:Cesium.Cartesian3.fromDegrees(obs.lng,obs.lat),")
         L.append("    point:{pixelSize:8,color:Cesium.Color.fromCssColorString('#7CFF6B').withAlpha(0.92),")
         L.append("      outlineColor:Cesium.Color.fromCssColorString('#0a1a06'),outlineWidth:1.5,")
-        L.append("      heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,")
-        L.append("      disableDepthTestDistance:Number.POSITIVE_INFINITY},")
+        L.append("      heightReference:Cesium.HeightReference.CLAMP_TO_GROUND},")
         L.append("    description:'<div style=\"color:#f0ead8;font-family:sans-serif;"
                  "font-size:14px;line-height:1.6;padding:4px 2px\">"
                  "<div style=\"font-weight:700;color:#7CFF6B;margin-bottom:4px\">'+obs.place+'</div>"
