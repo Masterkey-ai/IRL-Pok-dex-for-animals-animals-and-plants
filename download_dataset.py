@@ -1,27 +1,34 @@
 """
-NatureDex AI — Phase 4 Dataset Downloader
-==========================================
-Downloads research-grade, CC-licensed wildlife photos from iNaturalist
-for training a custom NC species classifier.
+NatureDex AI — Dataset Downloader (v2: auto-discovery)
+======================================================
+Builds a training dataset of North Carolina wildlife from research-grade,
+CC-licensed iNaturalist photos.
+
+WHAT CHANGED FROM v1:
+  - No more hand-typed species list. The script asks iNaturalist for the
+    MOST-OBSERVED species in North Carolina and uses their real taxon IDs,
+    common names, and scientific names. (This fixes the duplicate-taxon-id
+    bugs that hand-typed lists are prone to.)
+  - The NC place ID is looked up at runtime, so it's always correct.
+  - An image floor (MIN_IMAGES) keeps only well-supported species, which is
+    what keeps accuracy high as the species count grows.
+
+The output format is IDENTICAL to v1, so train_model.py works unchanged:
+    dataset/
+    ├── train/<species_slug>/*.jpg   (80%)
+    ├── val/<species_slug>/*.jpg     (20%)
+    ├── label_map.json
+    └── dataset_log.csv
+
+HOW TO TUNE (the two knobs that trade species-count vs accuracy):
+  - MAX_SPECIES   : how many of the top NC species to consider. Higher = more
+                    species (and a harder classification problem).
+  - MIN_IMAGES    : minimum photos a species needs to be included. Higher =
+                    fewer but better-trained classes (higher accuracy).
 
 Usage:
-    python download_dataset.py
-
-Output:
-    dataset/
-    ├── train/
-    │   ├── eastern_bluebird/   (80% of images)
-    │   ├── white_tailed_deer/
-    │   └── ...
-    ├── val/
-    │   ├── eastern_bluebird/   (20% of images)
-    │   └── ...
-    └── dataset_log.csv         (every image: URL, taxon, license, obs ID)
-
-This structure is ready for PyTorch ImageFolder / torchvision directly.
-
-Requirements:
     pip install requests Pillow tqdm
+    python download_dataset.py
 """
 
 import os
@@ -29,8 +36,6 @@ import csv
 import json
 import time
 import random
-import shutil
-import argparse
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -45,133 +50,117 @@ except ImportError:
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-NC_PLACE_ID   = 51          # iNaturalist place ID for North Carolina
-IMAGES_PER_SPECIES = 150    # target images per species (will get what's available)
-MIN_IMAGES    = 30          # skip species with fewer than this many available images
+STATE_NAME    = "North Carolina"   # looked up at runtime -> correct place_id
+
+MAX_SPECIES        = 200    # consider up to this many top-observed NC species
+IMAGES_PER_SPECIES = 200    # target images per species (gets what's available)
+MIN_IMAGES         = 80     # ACCURACY FLOOR: skip species with fewer than this
 IMG_SIZE      = 224         # resize all images to this (matches EfficientNet input)
 VAL_SPLIT     = 0.2         # 20% validation, 80% training
-RATE_LIMIT    = 0.6         # seconds between API requests (stay under 100/min)
+RATE_LIMIT    = 0.7         # seconds between API requests (stay under ~60/min)
+
+# Only real wildlife groups (no humans, no unknown taxa)
+ICONIC_TAXA = [
+    "Aves", "Mammalia", "Reptilia", "Amphibia",
+    "Insecta", "Arachnida", "Plantae", "Fungi",
+    "Mollusca", "Actinopterygii",
+]
+
 OUTPUT_DIR    = Path("dataset")
 LOG_FILE      = OUTPUT_DIR / "dataset_log.csv"
-USER_AGENT    = "NatureDexAI-DatasetDownloader/1.0 (tejo.mukkamala@student)"
+USER_AGENT    = "NatureDexAI-DatasetDownloader/2.0 (student project)"
+API           = "https://api.inaturalist.org/v1"
 
-# ── NC Species List ────────────────────────────────────────────────────────────
-# Curated list of commonly observed NC species with their iNaturalist taxon IDs.
-# Each tuple: (common_name, scientific_name, taxon_id, iconic_group)
-# Taxon IDs verified against iNaturalist as of 2025.
-# Mix of birds, mammals, reptiles, amphibians, insects, and plants — broad coverage.
-
-NC_SPECIES = [
-    # ── Birds ──────────────────────────────────────────────────────────────────
-    ("Eastern Bluebird",         "Sialia sialis",              9083,    "Aves"),
-    ("Northern Cardinal",        "Cardinalis cardinalis",      9200,    "Aves"),
-    ("American Robin",           "Turdus migratorius",         20727,   "Aves"),
-    ("Blue Jay",                 "Cyanocitta cristata",        8916,    "Aves"),
-    ("Carolina Chickadee",       "Poecile carolinensis",       13858,   "Aves"),
-    ("Red-tailed Hawk",          "Buteo jamaicensis",          5228,    "Aves"),
-    ("Great Blue Heron",         "Ardea herodias",             4849,    "Aves"),
-    ("Downy Woodpecker",         "Dryobates pubescens",        18772,   "Aves"),
-    ("American Goldfinch",       "Spinus tristis",             13632,   "Aves"),
-    ("Mourning Dove",            "Zenaida macroura",           8973,    "Aves"),
-    ("Red-bellied Woodpecker",   "Melanerpes carolinus",       18787,   "Aves"),
-    ("Eastern Towhee",           "Pipilo erythrophthalmus",    14886,   "Aves"),
-    ("White-breasted Nuthatch",  "Sitta carolinensis",         13933,   "Aves"),
-    ("Tufted Titmouse",          "Baeolophus bicolor",         13859,   "Aves"),
-    ("Brown Thrasher",           "Toxostoma rufum",            28544,   "Aves"),
-    ("Eastern Meadowlark",       "Sturnella magna",            13697,   "Aves"),
-    ("Ruby-throated Hummingbird","Archilochus colubris",       4849,    "Aves"),
-    ("Osprey",                   "Pandion haliaetus",          5579,    "Aves"),
-    ("Barred Owl",               "Strix varia",                4703,    "Aves"),
-    ("Canada Goose",             "Branta canadensis",          7107,    "Aves"),
-
-    # ── Mammals ────────────────────────────────────────────────────────────────
-    ("White-tailed Deer",        "Odocoileus virginianus",     42389,   "Mammalia"),
-    ("Eastern Gray Squirrel",    "Sciurus carolinensis",       46017,   "Mammalia"),
-    ("Virginia Opossum",         "Didelphis virginiana",       42754,   "Mammalia"),
-    ("Eastern Cottontail",       "Sylvilagus floridanus",      43916,   "Mammalia"),
-    ("Raccoon",                  "Procyon lotor",              41654,   "Mammalia"),
-    ("Red Fox",                  "Vulpes vulpes",              42069,   "Mammalia"),
-    ("Groundhog",                "Marmota monax",              43812,   "Mammalia"),
-    ("Eastern Chipmunk",         "Tamias striatus",            46024,   "Mammalia"),
-    ("Striped Skunk",            "Mephitis mephitis",          41905,   "Mammalia"),
-    ("North American River Otter","Lontra canadensis",         42189,   "Mammalia"),
-
-    # ── Reptiles ───────────────────────────────────────────────────────────────
-    ("Eastern Box Turtle",       "Terrapene carolina",         39556,   "Reptilia"),
-    ("Eastern Fence Lizard",     "Sceloporus undulatus",       37716,   "Reptilia"),
-    ("Black Racer",              "Coluber constrictor",        28963,   "Reptilia"),
-    ("Copperhead",               "Agkistrodon contortrix",     27379,   "Reptilia"),
-    ("Eastern Ratsnake",         "Pantherophis alleghaniensis",62234,   "Reptilia"),
-    ("Five-lined Skink",         "Plestiodon fasciatus",       37691,   "Reptilia"),
-    ("Snapping Turtle",          "Chelydra serpentina",        39620,   "Reptilia"),
-
-    # ── Amphibians ─────────────────────────────────────────────────────────────
-    ("American Bullfrog",        "Lithobates catesbeianus",    64968,   "Amphibia"),
-    ("Green Tree Frog",          "Dryophytes cinereus",        24971,   "Amphibia"),
-    ("Eastern Red-backed Salamander","Plethodon cinereus",     27112,   "Amphibia"),
-    ("Spring Peeper",            "Pseudacris crucifer",        24976,   "Amphibia"),
-
-    # ── Insects ────────────────────────────────────────────────────────────────
-    ("Monarch Butterfly",        "Danaus plexippus",           48662,   "Insecta"),
-    ("Eastern Tiger Swallowtail","Papilio glaucus",            54507,   "Insecta"),
-    ("Black Swallowtail",        "Papilio polyxenes",          55626,   "Insecta"),
-    ("Painted Lady",             "Vanessa cardui",             56459,   "Insecta"),
-    ("Eastern Carpenter Bee",    "Xylocopa virginica",         69247,   "Insecta"),
-    ("Firefly",                  "Photinus pyralis",           124922,  "Insecta"),
-    ("Praying Mantis",           "Mantis religiosa",           52954,   "Insecta"),
-    ("Luna Moth",                "Actias luna",                52933,   "Insecta"),
-    ("Common Whitetail",         "Plathemis lydia",            61372,   "Insecta"),
-    ("Japanese Beetle",          "Popillia japonica",          67757,   "Insecta"),
-
-    # ── Plants ─────────────────────────────────────────────────────────────────
-    ("Longleaf Pine",            "Pinus palustris",            53639,   "Plantae"),
-    ("Flowering Dogwood",        "Cornus florida",             58717,   "Plantae"),
-    ("Black-eyed Susan",         "Rudbeckia hirta",            55834,   "Plantae"),
-    ("Cardinal Flower",          "Lobelia cardinalis",         52350,   "Plantae"),
-    ("Wild Columbine",           "Aquilegia canadensis",       55945,   "Plantae"),
-    ("Virginia Creeper",         "Parthenocissus quinquefolia",54952,   "Plantae"),
-    ("Eastern Redbud",           "Cercis canadensis",          58720,   "Plantae"),
-    ("Pitcher Plant",            "Sarracenia purpurea",        52853,   "Plantae"),
-    ("Venus Flytrap",            "Dionaea muscipula",          49845,   "Plantae"),
-    ("Pokeweed",                 "Phytolacca americana",       55850,   "Plantae"),
-]
 
 # ── API Helpers ────────────────────────────────────────────────────────────────
 
 def api_get(url: str, params: dict) -> dict:
-    """Make a GET request to the iNaturalist v1 API with rate limiting."""
+    """GET request to the iNaturalist v1 API (rate-limited by caller)."""
     query = urllib.parse.urlencode(params)
-    full_url = f"{url}?{query}"
-    req = urllib.request.Request(
-        full_url,
-        headers={"User-Agent": USER_AGENT}
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    req = urllib.request.Request(f"{url}?{query}",
+                                 headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode())
 
 
-def fetch_observation_photos(taxon_id: int, max_results: int) -> list[dict]:
+def resolve_place_id(state_name: str) -> int:
     """
-    Fetch up to max_results research-grade photos for a taxon in NC.
-    Returns list of dicts with keys: photo_url, obs_id, license, quality_grade.
-    iNaturalist returns max 200 per page so we paginate if needed.
+    Look up the iNaturalist place_id for a US state by name, so we never
+    hardcode the wrong number. Prefers a state-level (admin_level 10) match.
     """
+    data = api_get(f"{API}/places/autocomplete", {"q": state_name})
+    results = data.get("results", [])
+    if not results:
+        raise SystemExit(f"Could not find a place named '{state_name}' on iNaturalist.")
+
+    # Prefer an exact, state-level match
+    for r in results:
+        if r.get("name", "").lower() == state_name.lower() and r.get("admin_level") == 10:
+            return r["id"]
+    # Fall back to the first exact-name match, then the top result
+    for r in results:
+        if r.get("name", "").lower() == state_name.lower():
+            return r["id"]
+    return results[0]["id"]
+
+
+def get_top_species(place_id: int, limit: int) -> list[dict]:
+    """
+    Ask iNaturalist for the most-observed species in this place.
+    Returns dicts: {common_name, scientific_name, taxon_id, iconic_group}.
+    """
+    species = []
+    page = 1
+    per_page = 100
+    while len(species) < limit:
+        data = api_get(f"{API}/observations/species_counts", {
+            "place_id":      place_id,
+            "quality_grade": "research",
+            "photos":        "true",
+            "iconic_taxa":   ",".join(ICONIC_TAXA),
+            "per_page":      per_page,
+            "page":          page,
+        })
+        results = data.get("results", [])
+        if not results:
+            break
+        for row in results:
+            taxon = row.get("taxon") or {}
+            if taxon.get("rank") != "species":   # skip genus/family-level IDs
+                continue
+            species.append({
+                "common_name":     taxon.get("preferred_common_name")
+                                   or taxon.get("name", "unknown"),
+                "scientific_name": taxon.get("name", "unknown"),
+                "taxon_id":        taxon.get("id"),
+                "iconic_group":    taxon.get("iconic_taxon_name", ""),
+                "observations":    row.get("count", 0),
+            })
+            if len(species) >= limit:
+                break
+        print(f"  discovered {len(species)} species...", flush=True)
+        page += 1
+        time.sleep(RATE_LIMIT)
+    return species
+
+
+def fetch_observation_photos(taxon_id: int, place_id: int, max_results: int) -> list[dict]:
+    """Fetch up to max_results research-grade, CC-licensed photo URLs for a taxon."""
     photos = []
     page = 1
     per_page = min(200, max_results)
-
     while len(photos) < max_results:
         try:
-            data = api_get("https://api.inaturalist.org/v1/observations", {
-                "taxon_id":     taxon_id,
-                "place_id":     NC_PLACE_ID,
-                "quality_grade":"research",
-                "photos":       "true",
-                "photo_license":"cc-by,cc-by-sa,cc-by-nc,cc-by-nc-sa,cc0",
-                "per_page":     per_page,
-                "page":         page,
-                "order":        "votes",      # highest-quality first
-                "order_by":     "votes",
+            data = api_get(f"{API}/observations", {
+                "taxon_id":      taxon_id,
+                "place_id":      place_id,
+                "quality_grade": "research",
+                "photos":        "true",
+                "photo_license": "cc-by,cc-by-sa,cc-by-nc,cc-by-nc-sa,cc0",
+                "per_page":      per_page,
+                "page":          page,
+                "order":         "votes",
+                "order_by":      "votes",
             })
         except Exception as e:
             print(f"    API error (page {page}): {e}")
@@ -180,55 +169,42 @@ def fetch_observation_photos(taxon_id: int, max_results: int) -> list[dict]:
         results = data.get("results", [])
         if not results:
             break
-
         for obs in results:
             obs_photos = obs.get("photos", [])
             if not obs_photos:
                 continue
-            photo = obs_photos[0]   # first photo per observation
-            url = photo.get("url", "")
+            url = obs_photos[0].get("url", "")
             if not url:
                 continue
-            # Replace 'square' (75px) with 'medium' (500px)
-            url = url.replace("/square.", "/medium.")
+            url = url.replace("/square.", "/medium.")   # 75px -> 500px
             photos.append({
-                "photo_url":     url,
-                "obs_id":        obs.get("id"),
-                "license":       photo.get("license_code", "unknown"),
-                "quality_grade": obs.get("quality_grade", ""),
-                "observed_on":   obs.get("observed_on", ""),
+                "photo_url": url,
+                "obs_id":    obs.get("id"),
+                "license":   obs_photos[0].get("license_code", "unknown"),
             })
             if len(photos) >= max_results:
                 break
-
         if len(results) < per_page:
-            break   # no more pages
+            break
         page += 1
         time.sleep(RATE_LIMIT)
-
     return photos
 
 
 def download_image(url: str, dest: Path) -> bool:
-    """Download and resize one image. Returns True on success."""
+    """Download, center-crop to square, resize, and save one image."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             img_bytes = resp.read()
-
         img = Image.open(BytesIO(img_bytes)).convert("RGB")
-
-        # Center-crop to square, then resize
         w, h = img.size
         short = min(w, h)
-        left  = (w - short) // 2
-        top   = (h - short) // 2
-        img   = img.crop((left, top, left + short, top + short))
-        img   = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-
+        left, top = (w - short) // 2, (h - short) // 2
+        img = img.crop((left, top, left + short, top + short))
+        img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
         img.save(dest, "JPEG", quality=92)
         return True
-
     except Exception:
         return False
 
@@ -236,110 +212,104 @@ def download_image(url: str, dest: Path) -> bool:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def slugify(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return name.lower().replace(" ", "_").replace("-", "_").replace("'", "")
 
 
 def main():
     print("=" * 60)
-    print("NatureDex AI — Dataset Downloader")
-    print(f"Target: {len(NC_SPECIES)} species × ~{IMAGES_PER_SPECIES} images")
-    print(f"Output: {OUTPUT_DIR.resolve()}")
+    print("NatureDex AI — Dataset Downloader v2 (auto-discovery)")
     print("=" * 60)
+
+    # 1) Resolve the correct NC place_id
+    print(f"\nResolving iNaturalist place_id for '{STATE_NAME}'...")
+    place_id = resolve_place_id(STATE_NAME)
+    print(f"  -> place_id = {place_id}")
+    print("  (sanity check: open "
+          f"https://www.inaturalist.org/observations?place_id={place_id} "
+          "— it should show NC)")
+
+    # 2) Discover the top species
+    print(f"\nDiscovering up to {MAX_SPECIES} most-observed NC species...")
+    candidates = get_top_species(place_id, MAX_SPECIES)
+    print(f"  Found {len(candidates)} candidate species.")
+    print(f"  Keeping only those with >= {MIN_IMAGES} usable images.\n")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     (OUTPUT_DIR / "train").mkdir(exist_ok=True)
     (OUTPUT_DIR / "val").mkdir(exist_ok=True)
 
     log_rows = []
-    label_map = {}   # slug → common_name, for saving alongside dataset
-
+    label_map = {}
     skipped = []
     downloaded_total = 0
 
-    for i, (common, scientific, taxon_id, group) in enumerate(NC_SPECIES):
+    for i, sp in enumerate(candidates):
+        common, scientific = sp["common_name"], sp["scientific_name"]
+        taxon_id, group = sp["taxon_id"], sp["iconic_group"]
         slug = slugify(common)
-        print(f"\n[{i+1}/{len(NC_SPECIES)}] {common} ({scientific})")
+        print(f"\n[{i+1}/{len(candidates)}] {common} ({scientific}) — "
+              f"{sp['observations']} obs")
 
-        # Fetch photo metadata
-        print(f"  Fetching photo list...")
         time.sleep(RATE_LIMIT)
-        photos = fetch_observation_photos(taxon_id, IMAGES_PER_SPECIES)
+        photos = fetch_observation_photos(taxon_id, place_id, IMAGES_PER_SPECIES)
 
         if len(photos) < MIN_IMAGES:
-            print(f"  ⚠  Only {len(photos)} photos available — skipping "
-                  f"(need {MIN_IMAGES} minimum)")
+            print(f"  skip — only {len(photos)} images (need {MIN_IMAGES})")
             skipped.append(common)
             continue
 
-        print(f"  Found {len(photos)} photos — downloading...")
-
-        # Split train/val
+        print(f"  {len(photos)} photos — downloading...")
         random.shuffle(photos)
-        n_val   = max(1, int(len(photos) * VAL_SPLIT))
-        val_set = photos[:n_val]
-        trn_set = photos[n_val:]
+        n_val = max(1, int(len(photos) * VAL_SPLIT))
+        splits = [("val", photos[:n_val]), ("train", photos[n_val:])]
 
         label_map[slug] = {
-            "common_name":    common,
-            "scientific_name":scientific,
-            "taxon_id":       taxon_id,
-            "iconic_group":   group,
+            "common_name":     common,
+            "scientific_name": scientific,
+            "taxon_id":        taxon_id,
+            "iconic_group":    group,
         }
 
-        for split, split_photos in [("train", trn_set), ("val", val_set)]:
+        for split, split_photos in splits:
             split_dir = OUTPUT_DIR / split / slug
             split_dir.mkdir(parents=True, exist_ok=True)
-
             ok = 0
-            for j, photo in enumerate(tqdm(split_photos,
-                                           desc=f"  {split}",
-                                           leave=False)):
+            for j, photo in enumerate(tqdm(split_photos, desc=f"  {split}", leave=False)):
                 dest = split_dir / f"{j:04d}.jpg"
                 if dest.exists():
                     ok += 1
                     continue
-
                 if download_image(photo["photo_url"], dest):
                     ok += 1
                     log_rows.append({
-                        "split":        split,
-                        "species_slug": slug,
-                        "common_name":  common,
-                        "scientific":   scientific,
-                        "taxon_id":     taxon_id,
-                        "obs_id":       photo["obs_id"],
-                        "license":      photo["license"],
-                        "url":          photo["photo_url"],
-                        "file":         str(dest),
+                        "split": split, "species_slug": slug,
+                        "common_name": common, "scientific": scientific,
+                        "taxon_id": taxon_id, "obs_id": photo["obs_id"],
+                        "license": photo["license"], "url": photo["photo_url"],
+                        "file": str(dest),
                     })
-                time.sleep(0.1)  # gentle on the CDN
-
+                time.sleep(0.1)
             downloaded_total += ok
-            print(f"    {split}: {ok}/{len(split_photos)} downloaded")
+            print(f"    {split}: {ok}/{len(split_photos)}")
 
-    # Save metadata
+    # Save metadata (same format as v1)
     with open(LOG_FILE, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "split","species_slug","common_name","scientific",
-            "taxon_id","obs_id","license","url","file"
-        ])
+            "split", "species_slug", "common_name", "scientific",
+            "taxon_id", "obs_id", "license", "url", "file"])
         writer.writeheader()
         writer.writerows(log_rows)
-
     with open(OUTPUT_DIR / "label_map.json", "w") as f:
         json.dump(label_map, f, indent=2)
 
-    # Summary
     print("\n" + "=" * 60)
     print("DONE")
+    print(f"  Species included:        {len(label_map)}")
     print(f"  Total images downloaded: {downloaded_total}")
-    print(f"  Species included:        {len(NC_SPECIES) - len(skipped)}")
     if skipped:
-        print(f"  Skipped (too few photos): {', '.join(skipped)}")
-    print(f"  Log saved to:            {LOG_FILE}")
+        print(f"  Skipped (too few images): {len(skipped)}")
     print(f"  Label map:               {OUTPUT_DIR / 'label_map.json'}")
-    print("\nNext step: copy the 'dataset/' folder to your Windows PC")
-    print("and run train_model.py")
+    print("\nNext: copy the dataset/ folder to your Windows PC and run train_model.py")
     print("=" * 60)
 
 

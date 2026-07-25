@@ -455,6 +455,10 @@ def load_custom_model():
         )
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval().to(device)
+        model.naturedex_meta = {
+            "val_accuracy": checkpoint.get("val_accuracy", 0),
+            "num_classes":  num_classes,
+        }
         with open(label_map_path) as f:
             label_map = json.load(f)
         print(f"[Custom model] Loaded — {num_classes} NC species, "
@@ -546,7 +550,10 @@ class AnalysisWorker(QThread):
                 label, confidence, alternatives, top_info = custom_result
                 raw_label    = label.lower().replace(" ", "_")
                 used_custom  = True
-                model_source = "NatureDex NC Model (89% accuracy)"
+                _meta = getattr(self.custom_model, "naturedex_meta", {})
+                model_source = (f"NatureDex NC Model — "
+                                f"{_meta.get('val_accuracy', 0):.0f}% acc, "
+                                f"{_meta.get('num_classes', 0)} NC species")
             else:
                 img = keras_image.load_img(tmp_path, target_size=(224, 224))
                 arr = preprocess_input(

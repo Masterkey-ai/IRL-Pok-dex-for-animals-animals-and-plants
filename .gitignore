@@ -21,3 +21,4 @@ env/
 dataset/
 models/
 .env
+dataset/
