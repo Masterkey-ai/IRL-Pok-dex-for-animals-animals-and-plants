@@ -64,6 +64,7 @@ CORRECTIONS_FILE  = Path.home() / ".naturedex_corrections.json"
 _SCRIPT_DIR           = Path(__file__).parent
 CUSTOM_MODEL_PTH      = _SCRIPT_DIR / "models" / "naturedex_nc_v1.pth"
 CUSTOM_MODEL_THRESHOLD = 60.0
+BIOCLIP_TOPK           = 5      # how many candidates BioCLIP returns per scan
 
 INVASIVE_REPORTS_FILE = Path.home() / ".naturedex_invasive_reports.json"
 
@@ -230,6 +231,139 @@ def _nc_rarity_label(nc_count: int) -> str:
     elif nc_count < 1000:  return "Uncommon in NC"
     elif nc_count < 10000: return "Common in NC"
     else:                  return "Very Common in NC"
+
+
+def _get_local_count(taxon_id: int, lat: float, lng: float, radius_km: int = 150) -> int:
+    """Count research-grade observations of a taxon within radius_km of the user.
+    Works anywhere on Earth — no place_id needed."""
+    try:
+        params = urllib.parse.urlencode({
+            "taxon_id": taxon_id, "lat": lat, "lng": lng, "radius": radius_km,
+            "quality_grade": "research", "per_page": 0,
+        })
+        req = urllib.request.Request(
+            f"https://api.inaturalist.org/v1/observations?{params}",
+            headers={"User-Agent": "NatureDexAI/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read().decode()).get("total_results", 0)
+    except Exception:
+        return 0
+
+
+def _local_rarity_label(count: int, area: str = "your area") -> str:
+    if count == 0:       return f"Not Recorded near {area}"
+    elif count < 10:     return f"Very Rare near {area}"
+    elif count < 100:    return f"Rare near {area}"
+    elif count < 1000:   return f"Uncommon near {area}"
+    elif count < 10000:  return f"Common near {area}"
+    else:                return f"Very Common near {area}"
+
+
+def get_nearby_species(lat: float, lng: float, n: int = 60, radius_km: int = 150) -> list:
+    """Most-observed species near a location — works anywhere on Earth.
+    Powers the location-scoped discovery index."""
+    species, page = [], 1
+    try:
+        while len(species) < n and page <= 3:
+            params = urllib.parse.urlencode({
+                "lat": lat, "lng": lng, "radius": radius_km,
+                "quality_grade": "research", "photos": "true",
+                "per_page": 100, "page": page,
+            })
+            req = urllib.request.Request(
+                f"https://api.inaturalist.org/v1/observations/species_counts?{params}",
+                headers={"User-Agent": "NatureDexAI/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            results = data.get("results", [])
+            if not results:
+                break
+            for row in results:
+                t = row.get("taxon") or {}
+                if t.get("rank") != "species":
+                    continue
+                species.append({
+                    "taxon_id":        t.get("id"),
+                    "common_name":     t.get("preferred_common_name") or t.get("name", ""),
+                    "scientific_name": t.get("name", ""),
+                    "iconic":          t.get("iconic_taxon_name", ""),
+                    "count":           row.get("count", 0),
+                })
+                if len(species) >= n:
+                    break
+            page += 1
+    except Exception as e:
+        print(f"[Nearby] {e}")
+    return species
+
+
+class NearbyWorker(QThread):
+    done = pyqtSignal(list)
+
+    def __init__(self, lat, lng):
+        super().__init__()
+        self.lat, self.lng = lat, lng
+
+    def run(self):
+        self.done.emit(get_nearby_species(self.lat, self.lng))
+
+
+# ─── Sticker Generation (cut-out) ─────────────────────────────────────────────
+# Turns a scan photo into a transparent-background "sticker" using U^2-Net via
+# onnxruntime. onnxruntime has clean macOS wheels (no compiler, no numba) and
+# works with numpy<2, so it coexists with TensorFlow. The ~5MB model downloads
+# once to ~/.naturedex_models/.
+#   pip install onnxruntime
+
+_U2NET_SESSION = None
+_U2NET_PATH = Path.home() / ".naturedex_models" / "u2netp.onnx"
+# Lightweight (~5MB) model. For higher quality, swap "u2netp.onnx" -> "u2net.onnx"
+# in both the filename and URL below (that model is ~176MB).
+_U2NET_URL  = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+
+def _get_u2net():
+    global _U2NET_SESSION
+    if _U2NET_SESSION is None:
+        import onnxruntime as ort
+        if not _U2NET_PATH.exists():
+            _U2NET_PATH.parent.mkdir(parents=True, exist_ok=True)
+            print("[Sticker] downloading cut-out model (one time, ~5MB)…")
+            urllib.request.urlretrieve(_U2NET_URL, _U2NET_PATH)
+        _U2NET_SESSION = ort.InferenceSession(
+            str(_U2NET_PATH), providers=["CPUExecutionProvider"])
+    return _U2NET_SESSION
+
+
+def make_sticker(input_path: str, output_path: str) -> str:
+    """Cut the subject out of a photo → transparent PNG. Returns path or ""."""
+    try:
+        sess = _get_u2net()
+        orig = PILImage.open(input_path).convert("RGB")
+
+        # Preprocess: 320x320, scale, ImageNet-style normalize, CHW batch
+        inp = orig.resize((320, 320), PILImage.LANCZOS)
+        arr = np.array(inp).astype(np.float32)
+        arr = arr / (arr.max() if arr.max() > 0 else 1.0)
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+        arr = arr.transpose(2, 0, 1)[None, ...].astype(np.float32)
+
+        # Inference → saliency mask, then normalize 0..1
+        out = sess.run(None, {sess.get_inputs()[0].name: arr})[0]
+        mask = out[0, 0]
+        mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
+
+        # Resize mask back to the original and apply it as the alpha channel
+        mask_img = PILImage.fromarray((mask * 255).astype("uint8")).resize(
+            orig.size, PILImage.LANCZOS)
+        rgba = orig.convert("RGBA")
+        rgba.putalpha(mask_img)
+        rgba.save(output_path)
+        return output_path
+    except Exception as e:
+        print(f"[Sticker] cut-out unavailable/failed ({e}) — using raw photo")
+        return ""
 
 
 # ─── Invasive Species (North Carolina) ────────────────────────────────────────
@@ -491,6 +625,63 @@ def run_custom_model(model, label_map, device, image_path: str):
         print(f"[Custom model] Inference error: {e}")
         return None
 
+# ─── Global Model (BioCLIP) ───────────────────────────────────────────────────
+# BioCLIP is a pretrained "tree of life" model covering ~950k taxa worldwide.
+# It handles anything the NC specialist model isn't confident about, making the
+# app global. No training required — install with:  pip install pybioclip
+
+def load_bioclip():
+    """Load the global BioCLIP classifier. Returns None if unavailable."""
+    try:
+        from bioclip import TreeOfLifeClassifier
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        classifier = TreeOfLifeClassifier(device=device)
+        print(f"[BioCLIP] Global model loaded on {device}")
+        return classifier
+    except Exception as e:
+        print(f"[BioCLIP] Not available ({e}) — global fallback disabled")
+        return None
+
+
+def _bioclip_names(pred: dict):
+    """Extract (common_name, scientific_name) from one BioCLIP prediction dict."""
+    genus = (pred.get("genus") or "").strip()
+    sp    = (pred.get("species") or "").strip()
+    # 'species' is sometimes the epithet, sometimes the full binomial
+    sci = sp if (genus and genus.lower() in sp.lower()) else f"{genus} {sp}".strip()
+    common = (pred.get("common_name") or pred.get("species_common_name")
+              or sci or "Unknown species")
+    return common, sci
+
+
+@torch.no_grad()
+def run_bioclip(classifier, image_path: str):
+    """Identify with the global model. Returns (label, conf%, alternatives, info)."""
+    if classifier is None:
+        return None
+    try:
+        from bioclip import Rank
+        preds = classifier.predict(image_path, Rank.SPECIES)
+        if not preds:
+            return None
+        preds = preds[:BIOCLIP_TOPK]
+        top = preds[0]
+        common, sci = _bioclip_names(top)
+        confidence  = float(top.get("score", 0)) * 100
+        alternatives = []
+        for p in preds[1:4]:
+            c, _ = _bioclip_names(p)
+            alternatives.append({"name": c,
+                                 "confidence": float(p.get("score", 0)) * 100})
+        top_info = {
+            "scientific_name": sci,
+            "iconic_group":    top.get("class") or top.get("phylum") or "",
+        }
+        return common, confidence, alternatives, top_info
+    except Exception as e:
+        print(f"[BioCLIP] Inference error: {e}")
+        return None
+
 # ─── Worker Threads ────────────────────────────────────────────────────────────
 
 class CameraThread(QThread):
@@ -527,7 +718,8 @@ class AnalysisWorker(QThread):
     error_occurred = pyqtSignal(str)
 
     def __init__(self, frame, model, client,
-                 custom_model=None, custom_label_map=None, custom_device=None):
+                 custom_model=None, custom_label_map=None, custom_device=None,
+                 bioclip=None):
         super().__init__()
         self.frame            = frame
         self.model            = model
@@ -535,26 +727,25 @@ class AnalysisWorker(QThread):
         self.custom_model     = custom_model
         self.custom_label_map = custom_label_map
         self.custom_device    = custom_device
+        self.bioclip          = bioclip
 
     def run(self):
         try:
             tmp_path = "/tmp/naturedex_scan.jpg"
             cv2.imwrite(tmp_path, self.frame)
+            sticker_tmp = make_sticker(tmp_path, "/tmp/naturedex_sticker.png")
 
-            used_custom   = False
-            custom_result = run_custom_model(
-                self.custom_model, self.custom_label_map,
-                self.custom_device, tmp_path)
+            used_custom   = False   # custom NC model retired from the pipeline
+            native_nc     = False   # set later from iNaturalist location data
 
-            if custom_result and custom_result[1] >= CUSTOM_MODEL_THRESHOLD:
-                label, confidence, alternatives, top_info = custom_result
+            # Primary identification: BioCLIP global model (~950k species worldwide)
+            bioclip_result = run_bioclip(self.bioclip, tmp_path)
+            if bioclip_result:
+                label, confidence, alternatives, top_info = bioclip_result
                 raw_label    = label.lower().replace(" ", "_")
-                used_custom  = True
-                _meta = getattr(self.custom_model, "naturedex_meta", {})
-                model_source = (f"NatureDex NC Model — "
-                                f"{_meta.get('val_accuracy', 0):.0f}% acc, "
-                                f"{_meta.get('num_classes', 0)} NC species")
+                model_source = "BioCLIP — global model (950k+ species)"
             else:
+                # Last-ditch fallback if BioCLIP isn't installed/available.
                 img = keras_image.load_img(tmp_path, target_size=(224, 224))
                 arr = preprocess_input(
                     np.expand_dims(keras_image.img_to_array(img), 0))
@@ -571,16 +762,22 @@ class AnalysisWorker(QThread):
                 ]
                 model_source = "MobileNetV2 (ImageNet)"
                 top_info     = {}
-                if custom_result:
-                    print(f"[Model] Custom low conf ({custom_result[1]:.1f}%) "
-                          f"— using MobileNetV2")
 
             inat_data = inat_lookup(label)
-            if used_custom and top_info.get("taxon_id"):
-                inat_data["taxon_id"]     = top_info["taxon_id"]
-                inat_data["iconic_taxon"] = top_info.get("iconic_group", "")
-                if not inat_data.get("nc_observations"):
-                    inat_data["nc_observations"] = _get_nc_count(top_info["taxon_id"])
+
+            # ── "Local to your area" detection (global, via iNaturalist) ──
+            # Works anywhere on Earth: count observations of this species near
+            # the user's location. Found nearby → it's local/native to them.
+            local_rarity = ""
+            taxon_id = inat_data.get("taxon_id") or top_info.get("taxon_id")
+            loc = _get_user_location()
+            if taxon_id and loc.get("lat") is not None:
+                local_count = _get_local_count(taxon_id, loc["lat"], loc["lng"])
+                area = loc.get("region") or loc.get("city") or "your area"
+                inat_data["local_observations"] = local_count
+                inat_data["local_area"]         = area
+                local_rarity = _local_rarity_label(local_count, area)
+                native_nc    = local_count > 0
 
             entry    = self._generate_entry(label, confidence, inat_data)
             nc_count = inat_data.get("nc_observations", 0)
@@ -606,13 +803,16 @@ class AnalysisWorker(QThread):
                 "entry":             entry,
                 "inat":              inat_data,
                 "rarity":            rarity,
+                "local_rarity":      local_rarity,
                 "nc_observations":   nc_count,
                 "model_source":      model_source,
                 "used_custom_model": used_custom,
+                "native_nc":         native_nc,
                 "phonetic":          phonetic,
                 "invasive":          invasive,
                 "timestamp":         datetime.datetime.now().isoformat(),
                 "image_path":        tmp_path,
+                "sticker_tmp":       sticker_tmp,
                 "scan_location":     _get_user_location(),
             })
         except Exception as e:
@@ -1217,14 +1417,15 @@ class GalleryCard(QFrame):
         img_container.setFixedSize(self.THUMB, self.THUMB)
         img_container.setStyleSheet("background: transparent;")
 
-        self._img_lbl = QLabel(img_container)
-        self._img_lbl.setFixedSize(self.THUMB, self.THUMB)
-        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._img_lbl.setStyleSheet("border-radius: 8px 8px 0 0; background: #000;")
+        # ── Bottom layer: the real scan photo (shown by default) ──
+        self._photo_lbl = QLabel(img_container)
+        self._photo_lbl.setFixedSize(self.THUMB, self.THUMB)
+        self._photo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._photo_lbl.setStyleSheet(f"border-radius: 8px 8px 0 0; background: {C_BG};")
+        raw = entry.get("saved_image_path", "")
         try:
-            path = entry.get("saved_image_path", "")
-            if path and Path(path).exists():
-                px = QPixmap(path)
+            if raw and Path(raw).exists():
+                px = QPixmap(raw)
                 if not px.isNull():
                     px = px.scaled(self.THUMB, self.THUMB,
                                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -1233,13 +1434,40 @@ class GalleryCard(QFrame):
                         x = (px.width()  - self.THUMB) // 2
                         y = (px.height() - self.THUMB) // 2
                         px = px.copy(x, y, self.THUMB, self.THUMB)
-                    self._img_lbl.setPixmap(px)
+                    self._photo_lbl.setPixmap(px)
                 else:
-                    self._img_lbl.setText("📷")
+                    self._photo_lbl.setText("📷")
             else:
-                self._img_lbl.setText("📷")
+                self._photo_lbl.setText("📷")
         except Exception:
-            self._img_lbl.setText("📷")
+            self._photo_lbl.setText("📷")
+
+        # ── Top layer: cut-out sticker on a checkerboard, revealed on click ──
+        self._has_sticker = False
+        self._sticker_shown = False
+        self._reveal_anim = None
+        self._sticker_lbl = QLabel(img_container)
+        self._sticker_lbl.setFixedSize(self.THUMB, self.THUMB)
+        self._sticker_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sticker_lbl.setStyleSheet("border-radius: 8px 8px 0 0; background: transparent;")
+        sticker = entry.get("sticker_path", "")
+        if sticker and Path(sticker).exists():
+            comp = self._build_sticker_pixmap(sticker)
+            if comp is not None:
+                self._sticker_lbl.setPixmap(comp)
+                self._has_sticker = True
+        self._sticker_effect = QGraphicsOpacityEffect(self._sticker_lbl)
+        self._sticker_effect.setOpacity(0.0)
+        self._sticker_lbl.setGraphicsEffect(self._sticker_effect)
+
+        self._spark = None
+        if self._has_sticker:
+            self._spark = QLabel("✨", img_container)
+            self._spark.setStyleSheet(
+                "background: rgba(10,14,26,0.65); color: #ffd77a;"
+                " border-radius: 7px; font-size: 10px; padding: 1px 4px;")
+            self._spark.move(6, self.THUMB - 24)
+            self._spark.setToolTip("Tap to reveal sticker")
 
         # Delete button — top-right corner of image, hidden until hover
         self._del_btn = QPushButton("✕", img_container)
@@ -1286,10 +1514,48 @@ class GalleryCard(QFrame):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        # Don't fire click if delete button was pressed
+        # Don't fire if the delete button was pressed
         if self._del_btn.geometry().contains(event.pos()):
             return
-        self.clicked_signal.emit(self._entry)
+        self._toggle_sticker()
+
+    def _toggle_sticker(self):
+        if not self._has_sticker:
+            return
+        self._sticker_shown = not self._sticker_shown
+        self._reveal_anim = QPropertyAnimation(self._sticker_effect, b"opacity")
+        self._reveal_anim.setDuration(300)
+        self._reveal_anim.setStartValue(self._sticker_effect.opacity())
+        self._reveal_anim.setEndValue(1.0 if self._sticker_shown else 0.0)
+        self._reveal_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._reveal_anim.start()
+        if self._spark is not None:
+            self._spark.setVisible(not self._sticker_shown)
+
+    def _build_sticker_pixmap(self, sticker_path):
+        """Composite the cut-out onto a classic transparency checkerboard."""
+        try:
+            st = QPixmap(sticker_path)
+            if st.isNull():
+                return None
+            size = self.THUMB
+            canvas = QPixmap(size, size)
+            canvas.fill(Qt.GlobalColor.transparent)
+            p = QPainter(canvas)
+            sq = 10
+            light, dark = QColor("#7c8ba0"), QColor("#586780")
+            for yy in range(0, size, sq):
+                for xx in range(0, size, sq):
+                    p.fillRect(xx, yy, sq, sq,
+                               light if ((xx // sq + yy // sq) % 2 == 0) else dark)
+            st = st.scaled(size - 10, size - 10,
+                           Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap((size - st.width()) // 2, (size - st.height()) // 2, st)
+            p.end()
+            return canvas
+        except Exception:
+            return None
 
 
 class CollectionCard(QFrame):
@@ -1423,6 +1689,7 @@ class NatureDexWindow(QMainWindow):
         self._custom_model     = None
         self._custom_label_map = None
         self._custom_device    = None
+        self._bioclip          = None
         self._models_loaded    = False
 
         self._setup_style()
@@ -1529,6 +1796,14 @@ class NatureDexWindow(QMainWindow):
             f"color: {C_TEXT}; font-size: 20px; font-weight: 800; letter-spacing: 1px;")
         h_layout.addWidget(title)
         h_layout.addStretch()
+
+        self._nearby_btn = QLabel("🧭")
+        self._nearby_btn.setStyleSheet(f"color: {C_ACCENT}; font-size: 18px;")
+        self._nearby_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._nearby_btn.setToolTip("Nearby Index — species to discover near you")
+        self._nearby_btn.mousePressEvent = lambda e: self._show_nearby_index()
+        h_layout.addWidget(self._nearby_btn)
+        h_layout.addSpacing(10)
 
         self._badges_btn = QLabel("🏆")
         self._badges_btn.setStyleSheet(f"color: {C_GOLD}; font-size: 18px;")
@@ -2399,6 +2674,7 @@ color:{C_SUBTEXT};font-size:14px;">
             try:
                 self._custom_model, self._custom_label_map, self._custom_device = \
                     load_custom_model()
+                self._bioclip = load_bioclip()
                 self._model = MobileNetV2(weights="imagenet")
                 self._client = OpenAI(
                     api_key=GROQ_API_KEY,
@@ -2450,7 +2726,8 @@ color:{C_SUBTEXT};font-size:14px;">
             frame, self._model, self._client,
             custom_model=self._custom_model,
             custom_label_map=self._custom_label_map,
-            custom_device=self._custom_device)
+            custom_device=self._custom_device,
+            bioclip=self._bioclip)
         self._analysis_worker.result_ready.connect(self._on_result)
         self._analysis_worker.error_occurred.connect(self._on_error)
         self._analysis_worker.start()
@@ -2489,6 +2766,10 @@ color:{C_SUBTEXT};font-size:14px;">
                                            result.get("timestamp", ""))
         if saved_path:
             result["saved_image_path"] = saved_path
+        sticker_saved = self._save_sticker(result.get("sticker_tmp", ""),
+                                           result.get("timestamp", ""))
+        if sticker_saved:
+            result["sticker_path"] = sticker_saved
 
         self._current_result = result
         self._chat_history   = []
@@ -2521,6 +2802,21 @@ color:{C_SUBTEXT};font-size:14px;">
                 return str(dest)
         except Exception as e:
             print(f"[Image save] {e}")
+        return ""
+
+    def _save_sticker(self, tmp_sticker: str, timestamp: str) -> str:
+        """Copy the temp cut-out sticker to a permanent PNG. Returns path or ""."""
+        try:
+            import shutil
+            images_dir = Path.home() / ".naturedex_images"
+            images_dir.mkdir(exist_ok=True)
+            safe_ts = timestamp.replace(":", "-").replace(".", "-")[:19]
+            dest = images_dir / f"sticker_{safe_ts}.png"
+            if tmp_sticker and Path(tmp_sticker).exists():
+                shutil.copy2(tmp_sticker, dest)
+                return str(dest)
+        except Exception as e:
+            print(f"[Sticker save] {e}")
         return ""
 
     def _on_error(self, msg):
@@ -2559,6 +2855,21 @@ color:{C_SUBTEXT};font-size:14px;">
     def _render_entry(self, result):
         self._clear_entry()
         entry = result.get("entry", {})
+
+        # ── Hero sticker — the cut-out of the user's own photo
+        sticker = result.get("sticker_path", "")
+        if sticker and Path(sticker).exists():
+            hero = QLabel()
+            hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hero.setFixedHeight(190)
+            hero.setStyleSheet("background: transparent;")
+            _px = QPixmap(sticker)
+            if not _px.isNull():
+                _px = _px.scaled(260, 180,
+                                 Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+                hero.setPixmap(_px)
+                self._entry_inner.addWidget(hero)
 
         # ── Name header
         name_frame = QFrame()
@@ -2647,9 +2958,19 @@ color:{C_SUBTEXT};font-size:14px;">
         conf_row.addWidget(conf_lbl)
 
         used_custom = result.get("used_custom_model", False)
-        model_badge = QLabel("🌿 NatureDex Model" if used_custom else "⚙ MobileNetV2")
+        src         = result.get("model_source", "")
+        if "BioCLIP" in src:
+            badge_txt, badge_hot = "🌍 BioCLIP · global", True
+        elif used_custom:
+            badge_txt, badge_hot = "🌿 NatureDex Model", True
+        else:
+            badge_txt, badge_hot = "⚙ MobileNetV2", False
+        if result.get("native_nc"):
+            badge_txt += "    📍 Local species"
+            badge_hot = True
+        model_badge = QLabel(badge_txt)
         model_badge.setStyleSheet(f"""
-            color: {C_ACCENT if used_custom else C_SUBTEXT};
+            color: {C_ACCENT if badge_hot else C_SUBTEXT};
             font-size: 9px;
             font-weight: 700;
             letter-spacing: 0.5px;
@@ -2671,7 +2992,7 @@ color:{C_SUBTEXT};font-size:14px;">
         conf_row.addStretch()
         nf_layout.addLayout(conf_row)
 
-        rarity     = result.get("rarity", "")
+        rarity     = result.get("local_rarity") or result.get("rarity", "")
         nc_obs     = result.get("nc_observations", None)
         inat       = result.get("inat", {})
         global_obs = inat.get("observations_count", 0)
@@ -3131,6 +3452,130 @@ color:{C_SUBTEXT};font-size:14px;">
             QTimer.singleShot(
                 idx * 3500,
                 lambda b=badge: self._toast.show_achievement(b["icon"], b["name"]))
+
+    def _show_nearby_index(self):
+        # Which species has the user already caught? (match by taxon id or name)
+        caught_taxa, caught_names = set(), set()
+        for e in self._collection:
+            inat = e.get("inat", {}) or {}
+            if inat.get("taxon_id"):
+                caught_taxa.add(inat["taxon_id"])
+            for nm in (inat.get("scientific_name", ""),
+                       e.get("entry", {}).get("scientific_name", ""),
+                       e.get("name", "")):
+                if nm:
+                    caught_names.add(nm.strip().lower())
+
+        def _is_caught(sp):
+            if sp.get("taxon_id") in caught_taxa:
+                return True
+            for nm in (sp.get("scientific_name", ""), sp.get("common_name", "")):
+                if nm and nm.strip().lower() in caught_names:
+                    return True
+            return False
+
+        # ── Panel shell (mirrors the achievements panel) ──
+        panel = QFrame(self)
+        panel.setStyleSheet(f"background: {C_PANEL}; border-radius: 12px;")
+        panel.setFixedSize(480, 560)
+        panel.move((self.width() - 480) // 2, (self.height() - 560) // 2)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(0)
+
+        header_row = QHBoxLayout()
+        title = QLabel("Nearby Index")
+        title.setStyleSheet(f"color: {C_TEXT}; font-size: 16px; font-weight: 800;")
+        close_btn = QLabel("✕")
+        close_btn.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 16px;")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.mousePressEvent = lambda e: panel.deleteLater()
+        header_row.addWidget(title)
+        header_row.addStretch()
+        header_row.addWidget(close_btn)
+        layout.addLayout(header_row)
+
+        subtitle = QLabel("Species to discover near you — 🔒 = still out there")
+        subtitle.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px;")
+        layout.addWidget(subtitle)
+        layout.addSpacing(12)
+
+        status = QLabel("Locating you and loading nearby species…")
+        status.setStyleSheet(f"color: {C_ACCENT}; font-size: 12px; font-weight: 700;")
+        status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(status)
+        layout.addSpacing(8)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background: transparent; border: none;")
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        grid = QVBoxLayout(content)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(8)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, stretch=1)
+
+        panel.show()
+
+        loc = _get_user_location()
+        if not loc.get("lat"):
+            status.setText("Couldn't detect your location. Check your connection.")
+            return
+        area = loc.get("region") or loc.get("city") or "you"
+
+        def _make_card(sp):
+            caught = _is_caught(sp)
+            card = QFrame()
+            card.setFixedSize(138, 74)
+            border = C_ACCENT if caught else C_BORDER
+            bg     = C_CARD if caught else C_BG
+            card.setStyleSheet(
+                f"QFrame {{ background: {bg}; border: 1px solid {border};"
+                f" border-radius: 8px; }}")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(9, 7, 9, 7)
+            cl.setSpacing(2)
+            top = QLabel("✓ FOUND" if caught else "🔒")
+            top.setStyleSheet(
+                f"color: {C_GREEN if caught else C_SUBTEXT};"
+                f" font-size: 9px; font-weight: 700; letter-spacing: 1px;")
+            cl.addWidget(top)
+            name_lbl = QLabel(sp.get("common_name", "???"))
+            name_lbl.setWordWrap(True)
+            name_lbl.setStyleSheet(
+                f"color: {C_TEXT if caught else C_SUBTEXT};"
+                f" font-size: 10px; font-weight: {'700' if caught else '500'};")
+            cl.addWidget(name_lbl)
+            return card
+
+        def _populate(species):
+            if not species:
+                status.setText("No nearby data found. Try again shortly.")
+                return
+            caught_n = sum(1 for sp in species if _is_caught(sp))
+            status.setText(f"📍 {area}  ·  {caught_n}/{len(species)} discovered")
+            row = None
+            for i, sp in enumerate(species):
+                if i % 3 == 0:
+                    row_w = QWidget(); row_w.setStyleSheet("background: transparent;")
+                    row = QHBoxLayout(row_w)
+                    row.setContentsMargins(0, 0, 0, 0); row.setSpacing(8)
+                    grid.addWidget(row_w)
+                row.addWidget(_make_card(sp))
+            if row is not None:
+                while row.count() < 3:
+                    filler = QWidget(); filler.setFixedSize(138, 74)
+                    filler.setStyleSheet("background: transparent;")
+                    row.addWidget(filler)
+            grid.addStretch()
+
+        self._nearby_worker = NearbyWorker(loc["lat"], loc["lng"])
+        self._nearby_worker.done.connect(_populate)
+        self._nearby_worker.start()
 
     def _show_badges_panel(self):
         # ── Compute current stats for progress bars ────────────────────────────

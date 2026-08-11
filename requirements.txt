@@ -1,7 +1,11 @@
-opencv-python
-numpy
+opencv-python==4.10.0.84
+numpy<2
 tensorflow
 pillow
 python-dotenv
 openai
 PyQt6
+torch
+torchvision
+pybioclip
+onnxruntime
