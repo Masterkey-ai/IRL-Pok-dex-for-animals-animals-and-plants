@@ -259,7 +259,7 @@ def _local_rarity_label(count: int, area: str = "your area") -> str:
     else:                return f"Very Common near {area}"
 
 
-def get_nearby_species(lat: float, lng: float, n: int = 60, radius_km: int = 150) -> list:
+def get_nearby_species(lat: float, lng: float, n: int = 24, radius_km: int = 150) -> list:
     """Most-observed species near a location — works anywhere on Earth.
     Powers the location-scoped discovery index."""
     species, page = [], 1
@@ -363,6 +363,188 @@ def make_sticker(input_path: str, output_path: str) -> str:
         return output_path
     except Exception as e:
         print(f"[Sticker] cut-out unavailable/failed ({e}) — using raw photo")
+        return ""
+
+
+# ─── Shareable Finds Card ─────────────────────────────────────────────────────
+# Composes a square-ish PNG a user can post to Instagram/etc. Pure PIL — no deps.
+
+def _hex_rgb(h: str):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _card_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    candidates = ([
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+    ] if bold else [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+    ]) + ["/System/Library/Fonts/Helvetica.ttc", "/Library/Fonts/Arial.ttf"]
+    for c in candidates:
+        try:
+            return ImageFont.truetype(c, size)
+        except Exception:
+            continue
+    from PIL import ImageFont as _IF
+    return _IF.load_default()
+
+
+def build_share_card(result: dict, out_path: str) -> str:
+    """Build a Pokémon-style trading-card PNG for a discovery. Returns path or ""."""
+    try:
+        from PIL import Image, ImageDraw
+        W, H = 1080, 1500
+
+        entry  = result.get("entry", {}) or {}
+        name   = (entry.get("common_name") or result.get("name") or "Unknown")
+        sci    = entry.get("scientific_name", "") or ""
+        group  = (entry.get("iconic_group") or entry.get("category")
+                  or (result.get("inat", {}) or {}).get("iconic_taxon", "") or "").strip()
+        rarity = result.get("local_rarity") or result.get("rarity") or ""
+        habitat = entry.get("habitat", "") or ""
+        fun     = entry.get("fun_fact", "") or entry.get("description", "") or ""
+        cons    = entry.get("conservation_status", "") or ""
+        area    = (result.get("inat", {}) or {}).get("local_area", "")
+        ts      = (result.get("timestamp", "") or "")[:10]
+
+        # Species group -> card "type" colour + tag
+        TYPES = {
+            "aves": ("#7fb3ff", "SKY"),      "mammalia": ("#d9a066", "BEAST"),
+            "insecta": ("#8bc34a", "BUG"),   "arachnida": ("#6b8e23", "BUG"),
+            "plantae": ("#57b95a", "FLORA"), "fungi": ("#b085f5", "FUNGAL"),
+            "reptilia": ("#c0a838", "SCALE"),"amphibia": ("#4dd0c0", "AQUA"),
+            "actinopterygii": ("#4aa3df", "AQUA"), "mollusca": ("#b085f5", "AQUA"),
+        }
+        tcol_hex, ttag = TYPES.get(group.lower(), ("#00d4ff", "WILD"))
+        tcol = _hex_rgb(tcol_hex)
+
+        # HP from rarity tier (rarer = more legendary)
+        rl = rarity.lower()
+        hp = (180 if ("very rare" in rl or "not recorded" in rl)
+              else 150 if "rare" in rl
+              else 120 if "uncommon" in rl
+              else 80  if "very common" in rl
+              else 100)
+
+        gold_l, gold_d = _hex_rgb("#f4d47a"), _hex_rgb("#a9822f")
+        dark, darker   = _hex_rgb("#12203a"), _hex_rgb("#0a0e1a")
+        white, red, ink = _hex_rgb("#f7fafc"), _hex_rgb("#e23b3b"), _hex_rgb("#101828")
+        body_col       = _hex_rgb("#c8d2e0")
+
+        img  = Image.new("RGB", (W, H), gold_d)
+        draw = ImageDraw.Draw(img)
+
+        # Metallic gold frame (light in the middle, darker at the edges)
+        for y in range(H):
+            t = abs((y / H) * 2 - 1)
+            draw.line([(0, y), (W, y)],
+                      fill=tuple(int(gold_l[i] + (gold_d[i] - gold_l[i]) * t) for i in range(3)))
+        # Type-coloured band, then the dark interior
+        draw.rounded_rectangle((26, 26, W - 26, H - 26), radius=40,
+                               fill=tuple(int(c * 0.55) for c in tcol), outline=gold_d, width=3)
+        draw.rounded_rectangle((48, 48, W - 48, H - 48), radius=30, fill=dark)
+
+        def wrap(text, font, maxw):
+            words, lines, cur = text.split(), [], ""
+            for w in words:
+                test = (cur + " " + w).strip()
+                if draw.textlength(test, font=font) <= maxw:
+                    cur = test
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            return lines
+
+        def energy(cx, cy, color):
+            draw.ellipse((cx - 17, cy - 17, cx + 17, cy + 17), fill=color, outline=gold_d, width=3)
+
+        # ── Name banner ──
+        draw.rounded_rectangle((72, 76, W - 72, 178), radius=20, fill=darker, outline=gold_d, width=2)
+        draw.text((96, 92), name.upper()[:18], font=_card_font(60, True), fill=white)
+        hp_txt = f"HP {hp}"
+        hf = _card_font(46, True); hb = draw.textbbox((0, 0), hp_txt, font=hf)
+        draw.text((W - 96 - (hb[2] - hb[0]), 100), hp_txt, font=hf, fill=red)
+        tf = _card_font(20, True); tb = draw.textbbox((0, 0), ttag, font=tf)
+        draw.rounded_rectangle((W - 96 - (tb[2] - tb[0]) - 26, 150, W - 96, 150 + 32),
+                               radius=16, fill=tcol)
+        draw.text((W - 96 - (tb[2] - tb[0]) - 13, 154), ttag, font=tf, fill=ink)
+
+        # ── Art window (the scan photo as card art) ──
+        art = (80, 198, W - 80, 762)
+        draw.rounded_rectangle(art, radius=14, fill=darker, outline=gold_l, width=6)
+        pic = result.get("saved_image_path") or result.get("sticker_path") or ""
+        if pic and Path(pic).exists():
+            pim = Image.open(pic).convert("RGB")
+            aw, ah = art[2] - art[0] - 16, art[3] - art[1] - 16
+            sr, dr = pim.width / pim.height, aw / ah
+            if sr > dr:
+                nh, nw = ah, int(ah * sr)
+            else:
+                nw, nh = aw, int(aw / sr)
+            pim = pim.resize((nw, nh))
+            lx, ty = (nw - aw) // 2, (nh - ah) // 2
+            pim = pim.crop((lx, ty, lx + aw, ty + ah))
+            img.paste(pim, (art[0] + 8, art[1] + 8))
+
+        # ── Scientific-name strip ──
+        draw.rounded_rectangle((80, 776, W - 80, 842), radius=12, fill=darker, outline=gold_d, width=2)
+        draw.text((100, 790), (sci if sci and sci != "Unknown" else name),
+                  font=_card_font(30, True), fill=gold_l)
+        if area:
+            an = f"RANGE: {area.upper()}"; af = _card_font(20, True)
+            ab = draw.textbbox((0, 0), an, font=af)
+            draw.text((W - 100 - (ab[2] - ab[0]), 798), an, font=af, fill=white)
+
+        # ── "Attacks" ──
+        y = 884
+        if habitat:
+            energy(110, y + 14, tcol)
+            draw.text((146, y - 6), "HABITAT", font=_card_font(34, True), fill=white)
+            yy = y + 44
+            for ln in wrap(habitat, _card_font(26), W - 210)[:2]:
+                draw.text((146, yy), ln, font=_card_font(26), fill=body_col); yy += 34
+            y = yy + 22
+            draw.line([(92, y - 14), (W - 92, y - 14)], fill=_hex_rgb("#2a3a52"), width=2)
+
+        if fun:
+            energy(110, y + 14, tcol); energy(148, y + 14, white)
+            draw.text((186, y - 6), "SIGNATURE TRAIT", font=_card_font(34, True), fill=white)
+            dmg = str(hp - 10); df = _card_font(46, True)
+            db = draw.textbbox((0, 0), dmg, font=df)
+            draw.text((W - 100 - (db[2] - db[0]), y - 8), dmg, font=df, fill=white)
+            yy = y + 48
+            for ln in wrap(fun, _card_font(26), W - 210)[:3]:
+                draw.text((146, yy), ln, font=_card_font(26), fill=body_col); yy += 34
+
+        # ── Bottom stat bar ──
+        by = H - 210
+        draw.line([(92, by), (W - 92, by)], fill=gold_d, width=2)
+        if rarity:
+            rf = _card_font(24, True); rb = draw.textbbox((0, 0), rarity, font=rf)
+            draw.rounded_rectangle((92, by + 20, 92 + (rb[2] - rb[0]) + 40, by + 66),
+                                   radius=23, fill=tcol)
+            draw.text((112, by + 28), rarity, font=rf, fill=ink)
+        if cons and cons not in ("N/A", ""):
+            cf = _card_font(24, True); cb = draw.textbbox((0, 0), cons.upper(), font=cf)
+            draw.text((W - 100 - (cb[2] - cb[0]), by + 28), cons.upper(), font=cf, fill=_hex_rgb("#ffd77a"))
+
+        # ── Footer ──
+        draw.text((96, H - 110), "Identified with NatureDex AI",
+                  font=_card_font(24, True), fill=_hex_rgb("#8895aa"))
+        if ts:
+            nf = _card_font(24, True); nb = draw.textbbox((0, 0), ts, font=nf)
+            draw.text((W - 100 - (nb[2] - nb[0]), H - 110), ts, font=nf, fill=_hex_rgb("#8895aa"))
+
+        img.save(out_path)
+        return out_path
+    except Exception as e:
+        print(f"[Share] card build failed: {e}")
         return ""
 
 
@@ -2191,6 +2373,25 @@ class NatureDexWindow(QMainWindow):
         """)
         self._report_btn.clicked.connect(self._on_report_wrong_id)
 
+        self._share_btn = QPushButton("📤  Share")
+        self._share_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._share_btn.setEnabled(False)
+        self._share_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_ACCENT};
+                color: {C_BG};
+                border: none;
+                border-radius: 13px;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 5px 16px;
+            }}
+            QPushButton:disabled {{ background: {C_BORDER}; color: {C_SUBTEXT}; }}
+            QPushButton:enabled:hover {{ background: #33ddff; }}
+        """)
+        self._share_btn.clicked.connect(self._on_share_card)
+
+        f_layout.addWidget(self._share_btn)
         f_layout.addStretch()
         f_layout.addWidget(self._report_btn)
         layout.addWidget(footer)
@@ -2784,6 +2985,7 @@ color:{C_SUBTEXT};font-size:14px;">
         self._switch_tab(0)
         self._reset_chat()
         self._report_btn.setEnabled(True)
+        self._share_btn.setEnabled(True)
         # Refresh gallery in background so it's ready when user navigates to it
         QTimer.singleShot(500, self._refresh_gallery)
 
@@ -3304,6 +3506,7 @@ color:{C_SUBTEXT};font-size:14px;">
         self._switch_tab(0)
         self._reset_chat()
         self._report_btn.setEnabled(True)
+        self._share_btn.setEnabled(True)
 
     def _on_delete_entry(self, timestamp):
         if not timestamp:
@@ -3856,6 +4059,34 @@ If asked about North Carolina specifically, provide NC-relevant context."""
             print(f"Could not save collection: {e}")
 
     # ── Correction System ──────────────────────────────────────────────────────
+
+    def _on_share_card(self):
+        if not self._current_result:
+            return
+        self._share_btn.setText("Creating…")
+        self._share_btn.setEnabled(False)
+        try:
+            ts = (self._current_result.get("timestamp", "") or "")
+            ts = ts.replace(":", "-").replace(".", "-")[:19] or "card"
+            out_dir = Path.home() / ".naturedex_images"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = str(out_dir / f"share_{ts}.png")
+            path = build_share_card(self._current_result, out)
+            if path:
+                try:
+                    import subprocess
+                    subprocess.run(["open", path])   # opens the card in Preview
+                except Exception:
+                    print(f"[Share] saved to {path}")
+                self._share_btn.setText("📤  Shared ✓")
+            else:
+                self._share_btn.setText("📤  Share")
+        except Exception as e:
+            print(f"[Share] {e}")
+            self._share_btn.setText("📤  Share")
+        finally:
+            self._share_btn.setEnabled(True)
+            QTimer.singleShot(2500, lambda: self._share_btn.setText("📤  Share"))
 
     def _on_report_wrong_id(self):
         if not self._current_result:
