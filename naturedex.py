@@ -45,8 +45,6 @@ except ImportError:
     _HAS_WEBENGINE = False
 
 import cv2
-from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, decode_predictions, preprocess_input
-from tensorflow.keras.preprocessing import image as keras_image
 from openai import OpenAI
 
 import torch
@@ -59,12 +57,14 @@ from PIL import Image as PILImage
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 COLLECTION_FILE   = Path.home() / ".naturedex_collection.json"
 ACHIEVEMENTS_FILE = Path.home() / ".naturedex_achievements.json"
+ONBOARD_FILE      = Path.home() / ".naturedex_onboarded"
 CORRECTIONS_FILE  = Path.home() / ".naturedex_corrections.json"
 
 _SCRIPT_DIR           = Path(__file__).parent
 CUSTOM_MODEL_PTH      = _SCRIPT_DIR / "models" / "naturedex_nc_v1.pth"
 CUSTOM_MODEL_THRESHOLD = 60.0
 BIOCLIP_TOPK           = 5      # how many candidates BioCLIP returns per scan
+LOW_CONFIDENCE_THRESHOLD = 10.0 # below this %, flag the ID as uncertain
 
 INVASIVE_REPORTS_FILE = Path.home() / ".naturedex_invasive_reports.json"
 
@@ -86,7 +86,7 @@ C_ACCENT2    = C_ACCENT_DIM
 C_SCREEN     = "#0f1409"
 C_SCAN_LINE  = C_ACCENT
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"   # Groq deprecated llama-3.3-70b-versatile (Jun 2026)
 
 # Cesium Ion token — only used for the star-field skybox assets, not imagery.
 # Imagery is served locally through the proxy below (no Ion dependency).
@@ -94,38 +94,47 @@ CESIUM_TOKEN = os.getenv("CESIUM_ION_TOKEN", "")
 
 ACHIEVEMENTS = [
     # ── Discovery count ────────────────────────────────────────────────────────
-    {"id": "first_scan",  "type": "count",      "threshold": 1,   "icon": "🔍", "name": "First Discovery",      "desc": "Scan your first species"},
-    {"id": "count_5",     "type": "count",      "threshold": 5,   "icon": "🌱", "name": "Budding Naturalist",   "desc": "Discover 5 species"},
-    {"id": "count_10",    "type": "count",      "threshold": 10,  "icon": "🌿", "name": "Field Explorer",       "desc": "Discover 10 species"},
-    {"id": "count_25",    "type": "count",      "threshold": 25,  "icon": "🌳", "name": "Wildlife Tracker",     "desc": "Discover 25 species"},
-    {"id": "count_50",    "type": "count",      "threshold": 50,  "icon": "🦅", "name": "Master Naturalist",    "desc": "Discover 50 species"},
-    {"id": "count_100",   "type": "count",      "threshold": 100, "icon": "🏆", "name": "NatureDex Legend",     "desc": "Discover 100 species"},
+    {"id": "first_scan", "type": "count",    "threshold": 1,   "icon": "🔍", "name": "First Discovery",      "desc": "Scan your first species"},
+    {"id": "count_5",    "type": "count",    "threshold": 5,   "icon": "🌱", "name": "Budding Naturalist",   "desc": "Discover 5 species"},
+    {"id": "count_10",   "type": "count",    "threshold": 10,  "icon": "🌿", "name": "Field Explorer",       "desc": "Discover 10 species"},
+    {"id": "count_25",   "type": "count",    "threshold": 25,  "icon": "🌳", "name": "Wildlife Tracker",     "desc": "Discover 25 species"},
+    {"id": "count_50",   "type": "count",    "threshold": 50,  "icon": "🦅", "name": "Master Naturalist",    "desc": "Discover 50 species"},
+    {"id": "count_100",  "type": "count",    "threshold": 100, "icon": "🏆", "name": "NatureDex Legend",     "desc": "Discover 100 species"},
 
     # ── Category diversity ─────────────────────────────────────────────────────
-    {"id": "cats_3",      "type": "category",   "threshold": 3,   "icon": "🎯", "name": "Well-Rounded",         "desc": "Find 3 different categories"},
-    {"id": "cats_5",      "type": "category",   "threshold": 5,   "icon": "🧭", "name": "Diverse Explorer",     "desc": "Find 5 different categories"},
-    {"id": "cats_7",      "type": "category",   "threshold": 7,   "icon": "🌍", "name": "Renaissance Scout",    "desc": "Find 7 different categories"},
+    {"id": "cats_3",     "type": "category", "threshold": 3,   "icon": "🎯", "name": "Well-Rounded",         "desc": "Find 3 different categories"},
+    {"id": "cats_5",     "type": "category", "threshold": 5,   "icon": "🧭", "name": "Diverse Explorer",     "desc": "Find 5 different categories"},
+    {"id": "cats_7",     "type": "category", "threshold": 7,   "icon": "🌍", "name": "Renaissance Scout",    "desc": "Find 7 different categories"},
+    {"id": "sweep",      "type": "sweep",    "threshold": 4,   "icon": "🃏", "name": "Full House",           "desc": "Find a bird, mammal, insect, AND plant"},
 
     # ── Rarity finds ───────────────────────────────────────────────────────────
-    {"id": "rare_1",      "type": "rarity",     "threshold": 1,   "icon": "💎", "name": "Rare Find",            "desc": "Discover a Rare or Very Rare NC species"},
-    {"id": "rare_5",      "type": "rarity",     "threshold": 5,   "icon": "🔮", "name": "Rarity Hunter",        "desc": "Discover 5 Rare or Very Rare NC species"},
+    {"id": "rare_1",     "type": "rarity",   "threshold": 1,   "icon": "💎", "name": "Rare Find",            "desc": "Discover a Rare or Very Rare species near you"},
+    {"id": "rare_5",     "type": "rarity",   "threshold": 5,   "icon": "🔮", "name": "Rarity Hunter",        "desc": "Discover 5 Rare or Very Rare species near you"},
 
-    # ── Endangered species ─────────────────────────────────────────────────────
-    {"id": "endanger_1",  "type": "endangered", "threshold": 1,   "icon": "🚨", "name": "Conservationist",      "desc": "Scan a Vulnerable, Endangered, or Critically Endangered species"},
-    {"id": "endanger_3",  "type": "endangered", "threshold": 3,   "icon": "🛡️", "name": "Species Guardian",     "desc": "Find 3 threatened species"},
+    # ── Conservation ───────────────────────────────────────────────────────────
+    {"id": "endanger_1", "type": "endangered","threshold": 1,  "icon": "🚨", "name": "Conservationist",      "desc": "Scan a threatened species"},
+    {"id": "endanger_3", "type": "endangered","threshold": 3,  "icon": "🛡️", "name": "Species Guardian",     "desc": "Find 3 threatened species"},
 
-    # ── NC native finds ────────────────────────────────────────────────────────
-    {"id": "nc_1",        "type": "nc_common",  "threshold": 1,   "icon": "🌲", "name": "Tar Heel Spotter",     "desc": "Find a species Common in NC"},
-    {"id": "nc_5",        "type": "nc_common",  "threshold": 5,   "icon": "🏔️", "name": "Carolina Naturalist",  "desc": "Find 5 species Common in NC"},
-    {"id": "nc_10",       "type": "nc_common",  "threshold": 10,  "icon": "🌾", "name": "NC Wildlife Expert",   "desc": "Find 10 species Common in NC"},
+    # ── Local to your area ─────────────────────────────────────────────────────
+    {"id": "local_1",    "type": "local",    "threshold": 1,   "icon": "📍", "name": "Local Spotter",        "desc": "Find a species native to your area"},
+    {"id": "local_5",    "type": "local",    "threshold": 5,   "icon": "🏡", "name": "Neighborhood Naturalist","desc": "Find 5 species native to your area"},
+    {"id": "local_15",   "type": "local",    "threshold": 15,  "icon": "🗺️", "name": "Local Legend",         "desc": "Find 15 species native to your area"},
 
-    # ── Custom model ───────────────────────────────────────────────────────────
-    {"id": "custom_1",    "type": "custom",     "threshold": 1,   "icon": "🤖", "name": "AI Identified",        "desc": "Get a result from the custom NC model"},
-    {"id": "custom_10",   "type": "custom",     "threshold": 10,  "icon": "🧬", "name": "Model Tested",         "desc": "Get 10 results from the custom NC model"},
+    # ── Sticker collection ─────────────────────────────────────────────────────
+    {"id": "sticker_3",  "type": "sticker",  "threshold": 3,   "icon": "✨", "name": "Sticker Starter",      "desc": "Collect 3 cut-out stickers"},
+    {"id": "sticker_15", "type": "sticker",  "threshold": 15,  "icon": "🎴", "name": "Sticker Collector",    "desc": "Collect 15 cut-out stickers"},
+
+    # ── Streaks (different days) ────────────────────────────────────────────────
+    {"id": "streak_3",   "type": "streak",   "threshold": 3,   "icon": "📅", "name": "Daily Explorer",       "desc": "Scan on 3 different days"},
+    {"id": "streak_7",   "type": "streak",   "threshold": 7,   "icon": "🔥", "name": "Devoted Naturalist",   "desc": "Scan on 7 different days"},
+
+    # ── Skill & travel ─────────────────────────────────────────────────────────
+    {"id": "highconf",   "type": "highconf", "threshold": 1,   "icon": "✅", "name": "Crystal Clear",        "desc": "Get a high-confidence identification"},
+    {"id": "region_3",   "type": "region",   "threshold": 3,   "icon": "🧳", "name": "Traveler",             "desc": "Discover species in 3 different regions"},
 
     # ── Corrections ────────────────────────────────────────────────────────────
-    {"id": "correct_1",   "type": "correct",    "threshold": 1,   "icon": "✏️", "name": "Fact Checker",         "desc": "Submit your first correction"},
-    {"id": "correct_5",   "type": "correct",    "threshold": 5,   "icon": "📚", "name": "Data Contributor",     "desc": "Submit 5 corrections to improve the model"},
+    {"id": "correct_1",  "type": "correct",  "threshold": 1,   "icon": "✏️", "name": "Fact Checker",         "desc": "Submit your first correction"},
+    {"id": "correct_5",  "type": "correct",  "threshold": 5,   "icon": "📚", "name": "Data Contributor",     "desc": "Submit 5 corrections"},
 ]
 
 NC_PLACE_ID = 51
@@ -155,15 +164,69 @@ def _write_wav(freqs, duration, volume=0.22, sample_rate=44100) -> str:
 _WAV_SCAN    = _write_wav([880], 0.08, 0.28)           # short beep
 _WAV_SUCCESS = _write_wav([523, 659, 784], 0.35, 0.20)  # C-E-G chord
 _WAV_BOOT    = _write_wav([261, 329, 392, 523], 0.55, 0.16)  # warm chord
+_WAV_UNLOCK  = _write_wav([659, 831, 988, 1319], 0.55, 0.22)  # bright fanfare chord
+_WAV_AMBIENT = _write_wav([131, 165, 196, 262], 8.0, 0.10)    # soft low pad, looped
+
+# Sound preferences (persisted)
+SOUND_CONFIG_FILE = Path.home() / ".naturedex_sound.json"
+_SOUND_ENABLED = True
+_AMBIENT_ON    = False
+_ambient_proc  = None
+
+def _load_sound_prefs():
+    global _SOUND_ENABLED, _AMBIENT_ON
+    try:
+        if SOUND_CONFIG_FILE.exists():
+            d = json.loads(SOUND_CONFIG_FILE.read_text())
+            _SOUND_ENABLED = d.get("enabled", True)
+            _AMBIENT_ON    = d.get("ambient", False)
+    except Exception:
+        pass
+
+def _save_sound_prefs():
+    try:
+        SOUND_CONFIG_FILE.write_text(
+            json.dumps({"enabled": _SOUND_ENABLED, "ambient": _AMBIENT_ON}))
+    except Exception:
+        pass
 
 def _play(path: str):
     """Play a WAV file non-blocking via afplay (macOS built-in)."""
+    if not _SOUND_ENABLED:
+        return
     try:
         subprocess.Popen(["afplay", path],
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
     except Exception:
         pass  # silently skip if afplay not available
+
+def _start_ambient():
+    """Loop the ambient pad in a background thread while ambient is on."""
+    global _ambient_proc
+    _stop_ambient()
+    def _loop():
+        global _ambient_proc
+        while _AMBIENT_ON and _SOUND_ENABLED:
+            try:
+                _ambient_proc = subprocess.Popen(
+                    ["afplay", _WAV_AMBIENT],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _ambient_proc.wait()
+            except Exception:
+                return
+    threading.Thread(target=_loop, daemon=True).start()
+
+def _stop_ambient():
+    global _ambient_proc
+    if _ambient_proc:
+        try:
+            _ambient_proc.terminate()
+        except Exception:
+            pass
+        _ambient_proc = None
+
+_load_sound_prefs()
 
 # ─── iNaturalist API Lookup ───────────────────────────────────────────────────
 
@@ -437,15 +500,28 @@ def build_share_card(result: dict, out_path: str) -> str:
         img  = Image.new("RGB", (W, H), gold_d)
         draw = ImageDraw.Draw(img)
 
-        # Metallic gold frame (light in the middle, darker at the edges)
-        for y in range(H):
-            t = abs((y / H) * 2 - 1)
-            draw.line([(0, y), (W, y)],
-                      fill=tuple(int(gold_l[i] + (gold_d[i] - gold_l[i]) * t) for i in range(3)))
-        # Type-coloured band, then the dark interior
-        draw.rounded_rectangle((26, 26, W - 26, H - 26), radius=40,
-                               fill=tuple(int(c * 0.55) for c in tcol), outline=gold_d, width=3)
-        draw.rounded_rectangle((48, 48, W - 48, H - 48), radius=30, fill=dark)
+        # ── Holographic foil background (rainbow diagonal + shimmer streaks) ──
+        xs = np.linspace(0, 1, W); ys = np.linspace(0, 1, H)
+        gx, gy = np.meshgrid(xs, ys)
+        hue  = ((((gx + gy) * 0.5 + 0.12) % 1.0) * 255).astype("uint8")
+        band = (np.sin((gx - gy) * 46) * 0.5 + 0.5)          # diagonal foil streaks
+        val  = (44 + band * 82).astype("uint8")               # kept dark for readability
+        sat  = np.full((H, W), 205, "uint8")
+        holo = Image.fromarray(np.stack([hue, sat, val], axis=-1), "HSV").convert("RGB")
+        img.paste(holo, (0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Gold double frame + a type-coloured accent line, holo showing through
+        draw.rounded_rectangle((0, 0, W - 1, H - 1), radius=46, outline=gold_l, width=12)
+        draw.rounded_rectangle((16, 16, W - 16, H - 16), radius=40, outline=gold_d, width=6)
+        draw.rounded_rectangle((30, 30, W - 30, H - 30), radius=34, outline=tcol, width=4)
+
+        # Translucent panel behind the lower text so it stays readable on the foil
+        ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(ov).rounded_rectangle((60, 858, W - 60, H - 84),
+                                             radius=24, fill=(8, 12, 22, 165))
+        img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+        draw = ImageDraw.Draw(img)
 
         def wrap(text, font, maxw):
             words, lines, cur = text.split(), [], ""
@@ -752,7 +828,7 @@ _custom_transform = transforms.Compose([
 
 def load_custom_model():
     if not CUSTOM_MODEL_PTH.exists():
-        print(f"[Custom model] Not found at {CUSTOM_MODEL_PTH} — using MobileNetV2 only")
+        print(f"[Custom model] Not found at {CUSTOM_MODEL_PTH} — using BioCLIP only")
         return None, None, None
     label_map_path = CUSTOM_MODEL_PTH.parent / "label_map.json"
     if not label_map_path.exists():
@@ -927,22 +1003,13 @@ class AnalysisWorker(QThread):
                 raw_label    = label.lower().replace(" ", "_")
                 model_source = "BioCLIP — global model (950k+ species)"
             else:
-                # Last-ditch fallback if BioCLIP isn't installed/available.
-                img = keras_image.load_img(tmp_path, target_size=(224, 224))
-                arr = preprocess_input(
-                    np.expand_dims(keras_image.img_to_array(img), 0))
-                decoded = decode_predictions(
-                    self.model.predict(arr, verbose=0), top=5)[0]
-                top          = decoded[0]
-                label        = top[1].replace("_", " ").title()
-                confidence   = top[2] * 100
-                raw_label    = top[1]
-                alternatives = [
-                    {"name": d[1].replace("_", " ").title(),
-                     "confidence": d[2] * 100}
-                    for d in decoded[1:4]
-                ]
-                model_source = "MobileNetV2 (ImageNet)"
+                # BioCLIP unavailable — return a clear "couldn't identify" result
+                # rather than a wrong guess.
+                label        = "Unidentified"
+                confidence   = 0.0
+                raw_label    = "unidentified"
+                alternatives = []
+                model_source = "No model available"
                 top_info     = {}
 
             inat_data = inat_lookup(label)
@@ -990,6 +1057,7 @@ class AnalysisWorker(QThread):
                 "model_source":      model_source,
                 "used_custom_model": used_custom,
                 "native_nc":         native_nc,
+                "low_confidence":    confidence < LOW_CONFIDENCE_THRESHOLD,
                 "phonetic":          phonetic,
                 "invasive":          invasive,
                 "timestamp":         datetime.datetime.now().isoformat(),
@@ -1512,6 +1580,129 @@ class ScanOverlay(QWidget):
         painter.end()
 
 
+class AchievementOverlay(QWidget):
+    """Full-window celebration: badge springs in and confetti bursts outward."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._particles = []
+        self._t = 0.0
+        self._icon = "🏆"
+        self._name = ""
+        self._badge_scale = 0.0
+        self._active = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def show_achievement(self, icon, name):
+        import random, math
+        self._icon, self._name = icon, name
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        self._t = 0.0
+        self._badge_scale = 0.0
+        self._active = True
+        cx, cy = self.width() // 2, self.height() // 2 - 30
+        palette = ["#00d4ff", "#ffd43b", "#39ff14", "#ff6b35",
+                   "#ff4fa3", "#a06bff", "#ffffff"]
+        self._particles = []
+        for _ in range(160):
+            ang = random.uniform(0, 2 * math.pi)
+            spd = random.uniform(7, 23)
+            self._particles.append({
+                "x": float(cx), "y": float(cy),
+                "vx": math.cos(ang) * spd,
+                "vy": math.sin(ang) * spd - random.uniform(3, 9),
+                "col": QColor(random.choice(palette)),
+                "w": random.uniform(7, 15), "h": random.uniform(9, 18),
+                "rot": random.uniform(0, 360), "vrot": random.uniform(-16, 16),
+                "life": 1.0,
+            })
+        self.show()
+        self.raise_()
+        self._timer.start(16)
+
+    def _tick(self):
+        self._t += 0.016
+        if self._badge_scale < 1.0:
+            self._badge_scale = min(1.0, self._badge_scale + 0.10)
+        for p in self._particles:
+            p["vy"] += 0.45
+            p["vx"] *= 0.99
+            p["x"] += p["vx"]; p["y"] += p["vy"]
+            p["rot"] += p["vrot"]
+            p["life"] -= 0.006
+        self._particles = [p for p in self._particles if p["life"] > 0]
+        self.update()
+        if self._t > 3.6:
+            self._finish()
+
+    def _finish(self):
+        self._timer.stop()
+        self._active = False
+        self.hide()
+
+    def mousePressEvent(self, e):
+        self._finish()
+
+    @staticmethod
+    def _ease_out_back(x):
+        c1 = 1.70158; c3 = c1 + 1
+        return 1 + c3 * ((x - 1) ** 3) + c1 * ((x - 1) ** 2)
+
+    def paintEvent(self, e):
+        if not self._active:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        if self._t < 0.3:
+            a = int(150 * (self._t / 0.3))
+        elif self._t > 3.0:
+            a = int(150 * max(0.0, (3.6 - self._t) / 0.6))
+        else:
+            a = 150
+        p.fillRect(self.rect(), QColor(5, 8, 16, a))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        for pt in self._particles:
+            p.save()
+            p.translate(pt["x"], pt["y"])
+            p.rotate(pt["rot"])
+            c = QColor(pt["col"])
+            c.setAlphaF(max(0.0, min(1.0, pt["life"])))
+            p.setBrush(c)
+            p.drawRect(int(-pt["w"] / 2), int(-pt["h"] / 2), int(pt["w"]), int(pt["h"]))
+            p.restore()
+
+        sc = self._ease_out_back(self._badge_scale)
+        cw, ch = 340, 220
+        cx, cy = w // 2, h // 2 - 30
+        bw, bh = int(cw * sc), int(ch * sc)
+        if bw > 4 and bh > 4:
+            rect = QRect(cx - bw // 2, cy - bh // 2, bw, bh)
+            p.setBrush(QColor(C_CARD))
+            pen = QPen(QColor(C_GOLD)); pen.setWidth(4)
+            p.setPen(pen)
+            p.drawRoundedRect(rect, 22, 22)
+            if self._badge_scale > 0.55:
+                p.setPen(QColor(C_GOLD))
+                fh = QFont(); fh.setPointSize(11); fh.setBold(True); p.setFont(fh)
+                p.drawText(QRect(cx - bw // 2, cy - bh // 2 + 16, bw, 24),
+                           int(Qt.AlignmentFlag.AlignHCenter), "★  ACHIEVEMENT UNLOCKED  ★")
+                fi = QFont(); fi.setPointSize(46); p.setFont(fi)
+                p.drawText(QRect(cx - bw // 2, cy - bh // 2 + 42, bw, 96),
+                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                           self._icon)
+                p.setPen(QColor(C_TEXT))
+                fn = QFont(); fn.setPointSize(17); fn.setBold(True); p.setFont(fn)
+                p.drawText(QRect(cx - bw // 2 + 10, cy + bh // 2 - 52, bw - 20, 40),
+                           int(Qt.AlignmentFlag.AlignHCenter), self._name)
+        p.end()
+
+
 class ToastNotification(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1836,6 +2027,97 @@ class CollectionCard(QFrame):
 
 # ─── Main Window ───────────────────────────────────────────────────────────────
 
+class OnboardingOverlay(QWidget):
+    """First-run welcome screen: what NatureDex does + how to use it."""
+
+    STEPS = [
+        ("🔍", "Point & Scan", "Aim at any plant, animal, or bug and press SCAN."),
+        ("📖", "Learn", "Get an instant ID plus habitat, diet, rarity, and fun facts."),
+        ("🧭", "Nearby Index", "See which species live around you and go find them."),
+        ("🎴", "Collect", "Every catch becomes a cut-out sticker and a shareable card."),
+        ("🏆", "Earn Awards", "Unlock badges and confetti as your collection grows."),
+    ]
+
+    def __init__(self, parent, on_done):
+        super().__init__(parent)
+        self._on_done = on_done
+        self.setGeometry(parent.rect())
+
+        self._card = QFrame(self)
+        self._card.setObjectName("onbCard")
+        self._card.setFixedSize(480, 560)
+        self._card.setStyleSheet(f"""
+            QFrame#onbCard {{
+                background: {C_PANEL};
+                border: 1px solid {C_BORDER};
+                border-radius: 18px;
+            }}
+            QLabel {{ background: transparent; border: none; }}
+        """)
+        cl = QVBoxLayout(self._card)
+        cl.setContentsMargins(30, 26, 30, 26)
+        cl.setSpacing(6)
+
+        title = QLabel("Welcome to NatureDex")
+        title.setStyleSheet(f"color: {C_ACCENT}; font-size: 24px; font-weight: 800;")
+        cl.addWidget(title)
+        tag = QLabel("Turn the world into a living Pokédex.")
+        tag.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 13px;")
+        cl.addWidget(tag)
+        cl.addSpacing(14)
+
+        for icon, name, desc in self.STEPS:
+            row = QHBoxLayout(); row.setSpacing(14)
+            ic = QLabel(icon); ic.setStyleSheet("font-size: 26px;")
+            ic.setFixedWidth(38)
+            row.addWidget(ic)
+            tb = QVBoxLayout(); tb.setSpacing(1)
+            nm = QLabel(name)
+            nm.setStyleSheet(f"color: {C_TEXT}; font-size: 14px; font-weight: 700;")
+            ds = QLabel(desc); ds.setWordWrap(True)
+            ds.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 12px;")
+            tb.addWidget(nm); tb.addWidget(ds)
+            row.addLayout(tb)
+            cl.addLayout(row)
+            cl.addSpacing(8)
+
+        cl.addStretch()
+        btn = QPushButton("Get Started  →")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(46)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_ACCENT}; color: {C_BG};
+                border: none; border-radius: 23px;
+                font-size: 15px; font-weight: 800; letter-spacing: 1px;
+            }}
+            QPushButton:hover {{ background: #33ddff; }}
+        """)
+        btn.clicked.connect(self._finish)
+        cl.addWidget(btn)
+
+        self._center()
+
+    def _center(self):
+        self._card.move((self.width() - self._card.width()) // 2,
+                        (self.height() - self._card.height()) // 2)
+
+    def resizeEvent(self, e):
+        self.setGeometry(self.parent().rect())
+        self._center()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(5, 8, 16, 205))
+        p.end()
+
+    def _finish(self):
+        try:
+            self._on_done()
+        finally:
+            self.deleteLater()
+
+
 class NatureDexWindow(QMainWindow):
 
     model_status_signal = pyqtSignal(str)
@@ -1876,6 +2158,7 @@ class NatureDexWindow(QMainWindow):
 
         self._setup_style()
         self._build_ui()
+        self._refresh_sound_icons()
 
         # ── Boot screen overlay ──────────────────────────────────────────────
         self._boot = BootScreen(self)
@@ -1890,7 +2173,7 @@ class NatureDexWindow(QMainWindow):
         _ensure_map_server()  # start early so port is known before first scan
         self._load_models_async()
 
-        self._toast = ToastNotification(self)
+        self._toast = AchievementOverlay(self)
         self._toast.move(self.width() - 300, 70)
 
     # ── Boot ───────────────────────────────────────────────────────────────────
@@ -1898,6 +2181,18 @@ class NatureDexWindow(QMainWindow):
     def _on_boot_done(self):
         self._boot.hide()
         self._boot.deleteLater()
+        if not ONBOARD_FILE.exists():
+            QTimer.singleShot(200, self._show_onboarding)
+
+    def _show_onboarding(self):
+        def _done():
+            try:
+                ONBOARD_FILE.write_text("1")
+            except Exception:
+                pass
+        self._onboarding = OnboardingOverlay(self, _done)
+        self._onboarding.show()
+        self._onboarding.raise_()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1968,31 +2263,50 @@ class NatureDexWindow(QMainWindow):
         layout.setSpacing(0)
 
         header = QFrame()
-        header.setFixedHeight(60)
+        header.setFixedHeight(78)
         header.setStyleSheet(f"background: {C_PANEL};")
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(18, 0, 14, 0)
+        header_v = QVBoxLayout(header)
+        header_v.setContentsMargins(18, 9, 12, 7)
+        header_v.setSpacing(7)
 
         title = QLabel("NatureDex")
         title.setStyleSheet(
             f"color: {C_TEXT}; font-size: 20px; font-weight: 800; letter-spacing: 1px;")
-        h_layout.addWidget(title)
-        h_layout.addStretch()
+        header_v.addWidget(title)
+
+        icon_row = QHBoxLayout()
+        icon_row.setContentsMargins(0, 0, 0, 0)
+        icon_row.setSpacing(16)
 
         self._nearby_btn = QLabel("🧭")
-        self._nearby_btn.setStyleSheet(f"color: {C_ACCENT}; font-size: 18px;")
+        self._nearby_btn.setStyleSheet(f"color: {C_ACCENT}; font-size: 17px;")
         self._nearby_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._nearby_btn.setToolTip("Nearby Index — species to discover near you")
         self._nearby_btn.mousePressEvent = lambda e: self._show_nearby_index()
-        h_layout.addWidget(self._nearby_btn)
-        h_layout.addSpacing(10)
+        icon_row.addWidget(self._nearby_btn)
 
         self._badges_btn = QLabel("🏆")
-        self._badges_btn.setStyleSheet(f"color: {C_GOLD}; font-size: 18px;")
+        self._badges_btn.setStyleSheet(f"color: {C_GOLD}; font-size: 17px;")
         self._badges_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._badges_btn.setToolTip("Achievements")
         self._badges_btn.mousePressEvent = lambda e: self._show_badges_panel()
-        h_layout.addWidget(self._badges_btn)
+        icon_row.addWidget(self._badges_btn)
+
+        self._sound_btn = QLabel("🔊")
+        self._sound_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sound_btn.setToolTip("Sound effects")
+        self._sound_btn.mousePressEvent = lambda e: self._toggle_sound()
+        icon_row.addWidget(self._sound_btn)
+
+        self._help_btn = QLabel("❔")
+        self._help_btn.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 16px;")
+        self._help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._help_btn.setToolTip("How to use NatureDex")
+        self._help_btn.mousePressEvent = lambda e: self._show_onboarding()
+        icon_row.addWidget(self._help_btn)
+
+        icon_row.addStretch()
+        header_v.addLayout(icon_row)
         layout.addWidget(header)
 
         divider = QFrame()
@@ -2876,7 +3190,6 @@ color:{C_SUBTEXT};font-size:14px;">
                 self._custom_model, self._custom_label_map, self._custom_device = \
                     load_custom_model()
                 self._bioclip = load_bioclip()
-                self._model = MobileNetV2(weights="imagenet")
                 self._client = OpenAI(
                     api_key=GROQ_API_KEY,
                     base_url="https://api.groq.com/openai/v1")
@@ -2903,6 +3216,21 @@ color:{C_SUBTEXT};font-size:14px;">
             self._loading_lbl.setStyleSheet(f"color: {C_RED}; font-size: 11px;")
 
     # ── Scan ───────────────────────────────────────────────────────────────────
+
+    def _refresh_sound_icons(self):
+        if hasattr(self, "_sound_btn"):
+            on = _SOUND_ENABLED
+            self._sound_btn.setText("🔊" if on else "🔇")
+            self._sound_btn.setStyleSheet(
+                f"color: {C_ACCENT if on else C_SUBTEXT}; font-size: 17px;")
+
+    def _toggle_sound(self):
+        global _SOUND_ENABLED
+        _SOUND_ENABLED = not _SOUND_ENABLED
+        _save_sound_prefs()
+        self._refresh_sound_icons()
+        if _SOUND_ENABLED:
+            _play(_WAV_SUCCESS)
 
     def _on_scan(self):
         if not self._models_loaded:
@@ -3058,6 +3386,29 @@ color:{C_SUBTEXT};font-size:14px;">
         self._clear_entry()
         entry = result.get("entry", {})
 
+        # ── Low-confidence warning (uncertain identification) ──
+        if result.get("low_confidence"):
+            warn = QFrame()
+            warn.setStyleSheet(f"""
+                QFrame {{
+                    background: #2a2410;
+                    border: 1px solid {C_YELLOW};
+                    border-radius: 10px;
+                }}
+            """)
+            wl = QVBoxLayout(warn)
+            wl.setContentsMargins(14, 10, 14, 10)
+            wl.setSpacing(2)
+            wt = QLabel(f"⚠  Not sure about this one ({result.get('confidence', 0):.0f}%)")
+            wt.setStyleSheet(f"color: {C_YELLOW}; font-size: 12px; font-weight: 700;")
+            ws = QLabel("The lighting or framing may be throwing it off. Try a clearer, "
+                        "closer, well-lit shot — or check the other possibilities below.")
+            ws.setWordWrap(True)
+            ws.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px;")
+            wl.addWidget(wt)
+            wl.addWidget(ws)
+            self._entry_inner.addWidget(warn)
+
         # ── Hero sticker — the cut-out of the user's own photo
         sticker = result.get("sticker_path", "")
         if sticker and Path(sticker).exists():
@@ -3166,7 +3517,7 @@ color:{C_SUBTEXT};font-size:14px;">
         elif used_custom:
             badge_txt, badge_hot = "🌿 NatureDex Model", True
         else:
-            badge_txt, badge_hot = "⚙ MobileNetV2", False
+            badge_txt, badge_hot = "⚙ Unidentified", False
         if result.get("native_nc"):
             badge_txt += "    📍 Local species"
             badge_hot = True
@@ -3591,40 +3942,53 @@ color:{C_SUBTEXT};font-size:14px;">
             print(f"Could not save achievements: {e}")
 
     def _check_achievements(self):
-        count  = len(self._collection)
+        coll   = self._collection
+        count  = len(coll)
         n_cats = len({
             e.get("entry", {}).get("category", "Unknown") or "Unknown"
-            for e in self._collection
+            for e in coll
         })
 
-        # Count rare/very rare NC species
+        # Rare / Very Rare near the user (falls back to NC rarity for old entries)
         n_rare = sum(
-            1 for e in self._collection
-            if any(w in e.get("rarity", "")
-                   for w in ("Rare in NC", "Very Rare in NC", "Not Recorded in NC"))
+            1 for e in coll
+            if "Rare near" in (e.get("local_rarity", "") or "")
+            or any(w in e.get("rarity", "")
+                   for w in ("Rare in NC", "Very Rare in NC"))
         )
 
-        # Count threatened/endangered species
         endangered_statuses = {"vulnerable", "endangered", "critically endangered"}
         n_endangered = sum(
-            1 for e in self._collection
+            1 for e in coll
             if e.get("entry", {}).get("conservation_status", "").lower()
             in endangered_statuses
         )
 
-        # Count species Common in NC
-        n_nc = sum(
-            1 for e in self._collection
-            if "Common in NC" in e.get("rarity", "")
-        )
+        # Native to the user's area
+        n_local = sum(1 for e in coll if e.get("native_nc"))
 
-        # Count custom model identifications
-        n_custom = sum(
-            1 for e in self._collection
-            if e.get("used_custom_model", False)
-        )
+        # Cut-out stickers collected
+        n_sticker = sum(1 for e in coll if e.get("sticker_path"))
 
-        # Count corrections submitted
+        # Bird / mammal / insect / plant sweep
+        groups = set()
+        for e in coll:
+            g = (e.get("entry", {}).get("iconic_group", "")
+                 or e.get("entry", {}).get("category", "") or "").lower()
+            if "av" in g or "bird" in g:            groups.add("bird")
+            elif "mamm" in g or "beast" in g:       groups.add("mammal")
+            elif "insect" in g or "arachn" in g or "bug" in g: groups.add("insect")
+            elif "plant" in g or "flora" in g or "fung" in g:  groups.add("plant")
+        n_sweep = len({"bird", "mammal", "insect", "plant"} & groups)
+
+        # Distinct scan days / regions; best confidence
+        n_days = len({(e.get("timestamp", "") or "")[:10] for e in coll if e.get("timestamp")})
+        n_regions = len({
+            (e.get("scan_location", {}) or {}).get("region", "")
+            for e in coll if (e.get("scan_location", {}) or {}).get("region")
+        })
+        n_highconf = sum(1 for e in coll if (e.get("confidence", 0) or 0) >= 50)
+
         n_correct = 0
         if CORRECTIONS_FILE.exists():
             try:
@@ -3632,19 +3996,19 @@ color:{C_SUBTEXT};font-size:14px;">
             except Exception:
                 pass
 
+        counters = {
+            "count": count, "category": n_cats, "rarity": n_rare,
+            "endangered": n_endangered, "local": n_local, "sticker": n_sticker,
+            "sweep": n_sweep, "streak": n_days, "region": n_regions,
+            "highconf": n_highconf, "correct": n_correct,
+        }
+
         newly = []
         for badge in ACHIEVEMENTS:
             if badge["id"] in self._unlocked_achievements:
                 continue
-            t = badge["type"]
-            thr = badge["threshold"]
-            if   t == "count"      and count       >= thr: newly.append(badge)
-            elif t == "category"   and n_cats       >= thr: newly.append(badge)
-            elif t == "rarity"     and n_rare        >= thr: newly.append(badge)
-            elif t == "endangered" and n_endangered  >= thr: newly.append(badge)
-            elif t == "nc_common"  and n_nc          >= thr: newly.append(badge)
-            elif t == "custom"     and n_custom      >= thr: newly.append(badge)
-            elif t == "correct"    and n_correct     >= thr: newly.append(badge)
+            if counters.get(badge["type"], 0) >= badge["threshold"]:
+                newly.append(badge)
 
         if not newly:
             return
@@ -3652,9 +4016,10 @@ color:{C_SUBTEXT};font-size:14px;">
             self._unlocked_achievements.add(badge["id"])
         self._save_achievements()
         for idx, badge in enumerate(newly):
-            QTimer.singleShot(
-                idx * 3500,
-                lambda b=badge: self._toast.show_achievement(b["icon"], b["name"]))
+            def _fire(b=badge):
+                _play(_WAV_UNLOCK)
+                self._toast.show_achievement(b["icon"], b["name"])
+            QTimer.singleShot(idx * 3500, _fire)
 
     def _show_nearby_index(self):
         # Which species has the user already caught? (match by taxon id or name)
@@ -3734,24 +4099,28 @@ color:{C_SUBTEXT};font-size:14px;">
             caught = _is_caught(sp)
             card = QFrame()
             card.setFixedSize(138, 74)
-            border = C_ACCENT if caught else C_BORDER
-            bg     = C_CARD if caught else C_BG
-            card.setStyleSheet(
-                f"QFrame {{ background: {bg}; border: 1px solid {border};"
-                f" border-radius: 8px; }}")
+            if caught:
+                card.setStyleSheet(
+                    "QFrame { background: #16321f; border: none; border-radius: 8px; }"
+                    " QLabel { border: none; background: transparent; }")
+            else:
+                card.setStyleSheet(
+                    f"QFrame {{ background: {C_BG}; border: 1px solid {C_BORDER};"
+                    f" border-radius: 8px; }}"
+                    " QLabel { border: none; background: transparent; }")
             cl = QVBoxLayout(card)
-            cl.setContentsMargins(9, 7, 9, 7)
-            cl.setSpacing(2)
-            top = QLabel("✓ FOUND" if caught else "🔒")
+            cl.setContentsMargins(10, 8, 10, 8)
+            cl.setSpacing(3)
+            top = QLabel("✓" if caught else "🔒")
             top.setStyleSheet(
                 f"color: {C_GREEN if caught else C_SUBTEXT};"
-                f" font-size: 9px; font-weight: 700; letter-spacing: 1px;")
+                f" font-size: 13px; font-weight: 700;")
             cl.addWidget(top)
             name_lbl = QLabel(sp.get("common_name", "???"))
             name_lbl.setWordWrap(True)
             name_lbl.setStyleSheet(
-                f"color: {C_TEXT if caught else C_SUBTEXT};"
-                f" font-size: 10px; font-weight: {'700' if caught else '500'};")
+                f"color: {C_GREEN if caught else C_SUBTEXT};"
+                f" font-size: 11px; font-weight: {'700' if caught else '500'};")
             cl.addWidget(name_lbl)
             return card
 
@@ -3782,30 +4151,40 @@ color:{C_SUBTEXT};font-size:14px;">
 
     def _show_badges_panel(self):
         # ── Compute current stats for progress bars ────────────────────────────
-        count  = len(self._collection)
+        coll   = self._collection
+        count  = len(coll)
         n_cats = len({
             e.get("entry", {}).get("category", "Unknown") or "Unknown"
-            for e in self._collection
+            for e in coll
         })
         n_rare = sum(
-            1 for e in self._collection
-            if any(w in e.get("rarity", "")
-                   for w in ("Rare in NC", "Very Rare in NC", "Not Recorded in NC"))
+            1 for e in coll
+            if "Rare near" in (e.get("local_rarity", "") or "")
+            or any(w in e.get("rarity", "") for w in ("Rare in NC", "Very Rare in NC"))
         )
         endangered_statuses = {"vulnerable", "endangered", "critically endangered"}
         n_endangered = sum(
-            1 for e in self._collection
+            1 for e in coll
             if e.get("entry", {}).get("conservation_status", "").lower()
             in endangered_statuses
         )
-        n_nc = sum(
-            1 for e in self._collection
-            if "Common in NC" in e.get("rarity", "")
-        )
-        n_custom = sum(
-            1 for e in self._collection
-            if e.get("used_custom_model", False)
-        )
+        n_local   = sum(1 for e in coll if e.get("native_nc"))
+        n_sticker = sum(1 for e in coll if e.get("sticker_path"))
+        groups = set()
+        for e in coll:
+            g = (e.get("entry", {}).get("iconic_group", "")
+                 or e.get("entry", {}).get("category", "") or "").lower()
+            if "av" in g or "bird" in g:            groups.add("bird")
+            elif "mamm" in g or "beast" in g:       groups.add("mammal")
+            elif "insect" in g or "arachn" in g or "bug" in g: groups.add("insect")
+            elif "plant" in g or "flora" in g or "fung" in g:  groups.add("plant")
+        n_sweep   = len({"bird", "mammal", "insect", "plant"} & groups)
+        n_days    = len({(e.get("timestamp", "") or "")[:10] for e in coll if e.get("timestamp")})
+        n_regions = len({
+            (e.get("scan_location", {}) or {}).get("region", "")
+            for e in coll if (e.get("scan_location", {}) or {}).get("region")
+        })
+        n_highconf = sum(1 for e in coll if (e.get("confidence", 0) or 0) >= 50)
         n_correct = 0
         if CORRECTIONS_FILE.exists():
             try:
@@ -3813,14 +4192,17 @@ color:{C_SUBTEXT};font-size:14px;">
             except Exception:
                 pass
 
+        _counters = {
+            "count": count, "category": n_cats, "rarity": n_rare,
+            "endangered": n_endangered, "local": n_local, "sticker": n_sticker,
+            "sweep": n_sweep, "streak": n_days, "region": n_regions,
+            "highconf": n_highconf, "correct": n_correct,
+        }
+
         def _progress(badge: dict) -> tuple[int, int]:
             """Return (current, max) for a badge's progress bar."""
-            t   = badge["type"]
             thr = badge["threshold"]
-            val = {"count": count, "category": n_cats, "rarity": n_rare,
-                   "endangered": n_endangered, "nc_common": n_nc,
-                   "custom": n_custom, "correct": n_correct}.get(t, 0)
-            return min(val, thr), thr
+            return min(_counters.get(badge["type"], 0), thr), thr
 
         # ── Build panel ────────────────────────────────────────────────────────
         panel = QFrame(self)
@@ -4139,6 +4521,7 @@ If asked about North Carolina specifically, provide NC-relevant context."""
     # ── Cleanup ────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        _stop_ambient()
         if self._camera_thread:
             self._camera_thread.stop()
         super().closeEvent(event)
