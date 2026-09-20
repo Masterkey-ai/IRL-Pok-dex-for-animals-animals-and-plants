@@ -58,6 +58,75 @@ GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 COLLECTION_FILE   = Path.home() / ".naturedex_collection.json"
 ACHIEVEMENTS_FILE = Path.home() / ".naturedex_achievements.json"
 ONBOARD_FILE      = Path.home() / ".naturedex_onboarded"
+CHALLENGES_FILE   = Path.home() / ".naturedex_challenges.json"
+
+
+def _species_group(entry_dict: dict) -> str:
+    """Map an entry's taxonomic group to a simple category name."""
+    g = (entry_dict.get("entry", {}).get("iconic_group", "")
+         or entry_dict.get("entry", {}).get("category", "") or "").lower()
+    if "av" in g or "bird" in g:                     return "bird"
+    if "mamm" in g or "beast" in g:                  return "mammal"
+    if "insect" in g or "arachn" in g or "bug" in g: return "insect"
+    if "plant" in g or "flora" in g:                 return "plant"
+    if "rept" in g or "scale" in g:                  return "reptile"
+    if "amphib" in g:                                return "amphibian"
+    if "fung" in g:                                  return "fungus"
+    return ""
+
+
+def generate_daily_challenges(date_str: str, has_location: bool = True) -> list:
+    """Deterministically pick 3 mixed challenges for a given date."""
+    import random
+    rng = random.Random(int(date_str.replace("-", "")))
+    cats = [("bird", "a bird"), ("mammal", "a mammal"), ("insect", "an insect"),
+            ("plant", "a plant"), ("reptile", "a reptile"), ("fungus", "a fungus")]
+    cat = rng.choice(cats)
+    count_target = rng.choice([2, 3])
+    category_ch = {"id": f"cat_{cat[0]}", "type": "category", "param": cat[0],
+                   "target": 1, "icon": "🎯", "text": f"Scan {cat[1]} today"}
+    pool = [
+        {"id": "rarity",  "type": "rarity",  "param": "", "target": 1, "icon": "💎",
+         "text": "Find something Uncommon or rarer"},
+        {"id": "count",   "type": "count",   "param": "", "target": count_target, "icon": "🔢",
+         "text": f"Make {count_target} discoveries today"},
+        {"id": "new",     "type": "new",     "param": "", "target": 1, "icon": "✨",
+         "text": "Scan a species new to your collection"},
+        {"id": "sticker", "type": "sticker", "param": "", "target": 1, "icon": "🎴",
+         "text": "Create a new sticker"},
+    ]
+    if has_location:
+        pool.append({"id": "native", "type": "native", "param": "", "target": 1,
+                     "icon": "📍", "text": "Find a species native to your area"})
+    rng.shuffle(pool)
+    return [category_ch] + pool[:2]
+
+
+def challenge_progress(ch: dict, today_scans: list, all_coll: list, today_str: str) -> int:
+    t, p = ch["type"], ch.get("param", "")
+    if t == "category":
+        return sum(1 for e in today_scans if _species_group(e) == p)
+    if t == "rarity":
+        return sum(1 for e in today_scans
+                   if any(w in (e.get("local_rarity", "") or "")
+                          for w in ("Uncommon near", "Rare near", "Very Rare near")))
+    if t == "count":
+        return len(today_scans)
+    if t == "native":
+        return sum(1 for e in today_scans if e.get("native_nc"))
+    if t == "sticker":
+        return sum(1 for e in today_scans if e.get("sticker_path"))
+    if t == "new":
+        cnt = 0
+        for e in today_scans:
+            nm = (e.get("name", "") or "").lower()
+            earlier = any((o.get("name", "") or "").lower() == nm
+                          and (o.get("timestamp", "") or "")[:10] < today_str
+                          for o in all_coll)
+            if not earlier:
+                cnt += 1
+        return cnt
+    return 0
 CORRECTIONS_FILE  = Path.home() / ".naturedex_corrections.json"
 
 _SCRIPT_DIR           = Path(__file__).parent
@@ -2137,6 +2206,7 @@ class NatureDexWindow(QMainWindow):
 
         self._collection            = self._load_collection()
         self._unlocked_achievements = self._load_achievements()
+        self._challenge_state = self._load_challenges()
         self._current_result        = None
         self._chat_history          = []
         self._camera_thread         = None
@@ -2159,6 +2229,7 @@ class NatureDexWindow(QMainWindow):
         self._setup_style()
         self._build_ui()
         self._refresh_sound_icons()
+        self._refresh_streak_label()
 
         # ── Boot screen overlay ──────────────────────────────────────────────
         self._boot = BootScreen(self)
@@ -2292,6 +2363,13 @@ class NatureDexWindow(QMainWindow):
         self._badges_btn.mousePressEvent = lambda e: self._show_badges_panel()
         icon_row.addWidget(self._badges_btn)
 
+        self._challenge_btn = QLabel("🔥")
+        self._challenge_btn.setStyleSheet(f"color: {C_ACCENT2}; font-size: 17px;")
+        self._challenge_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._challenge_btn.setToolTip("Daily challenges & streak")
+        self._challenge_btn.mousePressEvent = lambda e: self._show_challenges_panel()
+        icon_row.addWidget(self._challenge_btn)
+
         self._sound_btn = QLabel("🔊")
         self._sound_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sound_btn.setToolTip("Sound effects")
@@ -2323,6 +2401,10 @@ class NatureDexWindow(QMainWindow):
         self._species_count_lbl.setStyleSheet(
             f"color: {C_SUBTEXT}; font-size: 11px;")
         s_layout.addWidget(self._species_count_lbl)
+        s_layout.addStretch()
+        self._streak_lbl = QLabel("")
+        self._streak_lbl.setStyleSheet(f"color: {C_ACCENT2}; font-size: 11px; font-weight: 700;")
+        s_layout.addWidget(self._streak_lbl)
         layout.addWidget(stats_frame)
 
         search_frame = QFrame()
@@ -3309,6 +3391,8 @@ color:{C_SUBTEXT};font-size:14px;">
         self._refresh_category_filter_options()
         self._apply_filters()
         self._check_achievements()
+        self._update_streak_on_scan()
+        self._evaluate_challenges(fire=True)
         self._render_entry(result)
         self._switch_tab(0)
         self._reset_chat()
@@ -4148,6 +4232,177 @@ color:{C_SUBTEXT};font-size:14px;">
         self._nearby_worker = NearbyWorker(loc["lat"], loc["lng"])
         self._nearby_worker.done.connect(_populate)
         self._nearby_worker.start()
+
+    def _load_challenges(self):
+        if CHALLENGES_FILE.exists():
+            try:
+                return json.loads(CHALLENGES_FILE.read_text())
+            except Exception:
+                pass
+        return {"streak": 0, "best": 0, "last_active": "", "date": "", "notified": []}
+
+    def _save_challenges(self):
+        try:
+            CHALLENGES_FILE.write_text(json.dumps(self._challenge_state))
+        except Exception as e:
+            print(f"[Challenges] {e}")
+
+    @staticmethod
+    def _today_str():
+        return datetime.date.today().isoformat()
+
+    def _today_challenges(self):
+        has_loc = True
+        try:
+            has_loc = _get_user_location().get("lat") is not None
+        except Exception:
+            pass
+        return generate_daily_challenges(self._today_str(), has_loc)
+
+    def _streak_is_valid(self):
+        last = self._challenge_state.get("last_active", "")
+        d = datetime.date.today()
+        return last in (d.isoformat(),
+                        (d - datetime.timedelta(days=1)).isoformat())
+
+    def _refresh_streak_label(self):
+        if hasattr(self, "_streak_lbl"):
+            s = self._challenge_state.get("streak", 0) if self._streak_is_valid() else 0
+            self._streak_lbl.setText(f"🔥 {s}" if s > 0 else "")
+
+    def _update_streak_on_scan(self):
+        today = datetime.date.today()
+        st = self._challenge_state
+        last = st.get("last_active", "")
+        if last == today.isoformat():
+            return
+        yesterday = (today - datetime.timedelta(days=1)).isoformat()
+        st["streak"] = st.get("streak", 0) + 1 if last == yesterday else 1
+        st["last_active"] = today.isoformat()
+        st["best"] = max(st.get("best", 0), st["streak"])
+        self._save_challenges()
+
+    def _evaluate_challenges(self, fire=True):
+        today = self._today_str()
+        st = self._challenge_state
+        if st.get("date") != today:
+            st["date"] = today
+            st["notified"] = []
+            self._save_challenges()
+        today_scans = [e for e in self._collection
+                       if (e.get("timestamp", "") or "")[:10] == today]
+        challenges = self._today_challenges()
+        newly = []
+        for ch in challenges:
+            done = challenge_progress(ch, today_scans, self._collection, today) >= ch["target"]
+            if done and ch["id"] not in st["notified"]:
+                st["notified"].append(ch["id"])
+                newly.append(ch)
+        if newly:
+            self._save_challenges()
+            if fire:
+                all_done = all(
+                    challenge_progress(c, today_scans, self._collection, today) >= c["target"]
+                    for c in challenges)
+                t = 0
+                for i, ch in enumerate(newly):
+                    def _fire(c=ch):
+                        _play(_WAV_UNLOCK)
+                        self._toast.show_achievement("🔥", "Challenge: " + c["text"])
+                    QTimer.singleShot(i * 3500, _fire)
+                    t = (i + 1) * 3500
+                if all_done:
+                    streak = st.get("streak", 0)
+                    def _fire_all():
+                        _play(_WAV_UNLOCK)
+                        self._toast.show_achievement(
+                            "🔥", f"All challenges done — {streak}-day streak!")
+                    QTimer.singleShot(t, _fire_all)
+        self._refresh_streak_label()
+
+    def _show_challenges_panel(self):
+        today = self._today_str()
+        today_scans = [e for e in self._collection
+                       if (e.get("timestamp", "") or "")[:10] == today]
+        challenges = self._today_challenges()
+        st = self._challenge_state
+        streak = st.get("streak", 0) if self._streak_is_valid() else 0
+        best = st.get("best", 0)
+
+        panel = QFrame(self)
+        panel.setObjectName("chalPanel")
+        panel.setFixedSize(460, 470)
+        panel.move((self.width() - 460) // 2, (self.height() - 470) // 2)
+        panel.setStyleSheet(
+            f"QFrame#chalPanel {{ background: {C_PANEL}; border: 1px solid {C_BORDER};"
+            f" border-radius: 14px; }} QLabel {{ background: transparent; border: none; }}")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        title = QLabel("Daily Challenges")
+        title.setStyleSheet(f"color: {C_TEXT}; font-size: 17px; font-weight: 800;")
+        close = QLabel("✕")
+        close.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 16px;")
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.mousePressEvent = lambda e: panel.deleteLater()
+        hdr.addWidget(title); hdr.addStretch(); hdr.addWidget(close)
+        lay.addLayout(hdr)
+
+        streak_lbl = QLabel(
+            f"🔥 {streak}-day streak" + (f"    ·    best {best}" if best else ""))
+        streak_lbl.setStyleSheet(f"color: {C_ACCENT2}; font-size: 14px; font-weight: 700;")
+        lay.addWidget(streak_lbl)
+        sub = QLabel("Complete all three today to keep your streak going.")
+        sub.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 11px;")
+        lay.addWidget(sub)
+        lay.addSpacing(12)
+
+        for ch in challenges:
+            prog = challenge_progress(ch, today_scans, self._collection, today)
+            done = prog >= ch["target"]
+            pct = max(0, min(100, int(prog / ch["target"] * 100)))
+
+            row = QFrame()
+            row.setObjectName("chalRow")
+            row.setStyleSheet(
+                f"QFrame#chalRow {{ background: {'#16321f' if done else C_CARD};"
+                f" border-radius: 10px; }} QLabel {{ background: transparent; border: none; }}")
+            rl = QVBoxLayout(row)
+            rl.setContentsMargins(14, 11, 14, 12)
+            rl.setSpacing(8)
+
+            top = QHBoxLayout()
+            ic = QLabel("✅" if done else ch["icon"])
+            ic.setStyleSheet("font-size: 18px;"); ic.setFixedWidth(30)
+            txt = QLabel(ch["text"])
+            txt.setStyleSheet(f"color: {C_TEXT}; font-size: 13px; font-weight: 600;")
+            cnt = QLabel(f"{min(prog, ch['target'])}/{ch['target']}")
+            cnt.setStyleSheet(
+                f"color: {C_GREEN if done else C_SUBTEXT}; font-size: 12px; font-weight: 700;")
+            top.addWidget(ic); top.addWidget(txt); top.addStretch(); top.addWidget(cnt)
+            rl.addLayout(top)
+
+            bar = QWidget()
+            bar.setFixedHeight(6)
+            bl = QHBoxLayout(bar); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(0)
+            if pct > 0:
+                fill = QFrame()
+                fill.setStyleSheet(
+                    f"background: {C_GREEN if done else C_ACCENT}; border-radius: 3px;")
+                bl.addWidget(fill, pct)
+            if pct < 100:
+                rest = QFrame()
+                rest.setStyleSheet(f"background: {C_BORDER}; border-radius: 3px;")
+                bl.addWidget(rest, 100 - pct)
+            rl.addWidget(bar)
+            lay.addWidget(row)
+            lay.addSpacing(6)
+
+        lay.addStretch()
+        panel.show()
+        panel.raise_()
 
     def _show_badges_panel(self):
         # ── Compute current stats for progress bars ────────────────────────────
