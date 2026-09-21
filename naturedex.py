@@ -27,11 +27,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QScrollArea, QFrame, QTextEdit, QLineEdit,
     QSplitter, QStackedWidget, QGraphicsOpacityEffect, QComboBox,
-    QMenu, QGraphicsDropShadowEffect, QProgressBar
+    QMenu, QGraphicsDropShadowEffect, QProgressBar, QLayout, QSizePolicy
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation,
-    QEasingCurve, QRect, QSize, pyqtProperty, QObject
+    QEasingCurve, QRect, QSize, pyqtProperty, QObject, QPoint
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush,
@@ -1009,6 +1009,67 @@ def run_bioclip(classifier, image_path: str):
         print(f"[BioCLIP] Inference error: {e}")
         return None
 
+# ─── Flow Layout (wraps its children to the next line when narrow) ──────────────
+
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, spacing=6):
+        super().__init__(parent)
+        self._items = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        x, y = rect.x(), rect.y()
+        line_height = 0
+        spacing = self.spacing()
+        for item in self._items:
+            w = item.sizeHint().width()
+            h = item.sizeHint().height()
+            if x + w > rect.right() and line_height > 0:
+                x = rect.x()
+                y += line_height + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+            x += w + spacing
+            line_height = max(line_height, h)
+        return y + line_height - rect.y()
+
+
 # ─── Worker Threads ────────────────────────────────────────────────────────────
 
 class CameraThread(QThread):
@@ -1104,9 +1165,10 @@ class AnalysisWorker(QThread):
             # Generate phonetic pronunciation for any real scientific name
             sci_name = (entry.get("scientific_name") or
                         inat_data.get("scientific_name") or "")
-            phonetic = (self._get_phonetic(sci_name)
-                        if sci_name and sci_name not in ("Unknown", "N/A", "")
-                        else "")
+            phonetic, phonetic_speech = (
+                self._get_phonetic(sci_name)
+                if sci_name and sci_name not in ("Unknown", "N/A", "")
+                else ("", ""))
 
             # Flag invasive species of concern in North Carolina
             invasive = check_invasive(
@@ -1128,6 +1190,7 @@ class AnalysisWorker(QThread):
                 "native_nc":         native_nc,
                 "low_confidence":    confidence < LOW_CONFIDENCE_THRESHOLD,
                 "phonetic":          phonetic,
+                "phonetic_speech":   phonetic_speech,
                 "invasive":          invasive,
                 "timestamp":         datetime.datetime.now().isoformat(),
                 "image_path":        tmp_path,
@@ -1232,49 +1295,56 @@ Return ONLY the JSON object. No other text."""
                 "description":           "Entry generation failed — try scanning again.",
             }
 
-    def _get_phonetic(self, scientific_name: str) -> str:
-        """Generate accurate phonetic pronunciation for a Latin scientific name.
-        Only runs for real binomial names (genus + species).
-        Uses Groq with a strict prompt grounded in biological Latin rules."""
-        if not scientific_name:
-            return ""
-        if scientific_name.lower().strip() in ("unknown", "n/a", ""):
-            return ""
-
+    def _get_phonetic(self, scientific_name: str):
+        """Return (display, speech) pronunciations for a Latin scientific name.
+        `display` is a hyphenated guide with the stressed syllable capitalized.
+        `speech` is respelled for a US-English text-to-speech engine so it says
+        the Latin correctly instead of reading it with English spelling rules."""
+        if not scientific_name or scientific_name.lower().strip() in ("unknown", "n/a", ""):
+            return "", ""
         try:
             prompt = (
-                "You are a biology professor who pronounces Latin scientific names. "
-                "Convert this scientific name to a phonetic pronunciation guide "
-                "following these strict rules:\n"
-                "- Use hyphens between syllables\n"
-                "- CAPITALIZE the stressed syllable\n"
-                "- 'ae' = ee, 'oe' = ee, 'c' before e/i = s, 'ch' = k, "
-                "'g' before e/i = j, 'ph' = f, final 'a' = ah, "
-                "final 'us' = us, final 'is' = is\n"
-                "- Stress: second-to-last syllable if it ends in a consonant "
-                "or has two vowels, otherwise third-to-last\n"
-                "Reply with ONLY the phonetic guide for each word separated by a space. "
-                "No explanation. No punctuation other than hyphens.\n\n"
+                "You pronounce Latin biological scientific names. For the name below, "
+                "give its pronunciation in TWO formats.\n"
+                "Rules: 'ae'/'oe' = ee, 'c' before e/i = s, 'ch' = k, 'g' before e/i = j, "
+                "'ph' = f, final 'a' = ah, final 'us' = us, final 'is' = iss, 'ii' = ee-eye. "
+                "Stress the second-to-last syllable if it's heavy, else third-to-last.\n"
+                "Reply with EXACTLY two lines, nothing else:\n"
+                "DISPLAY: <syllables hyphenated, CAPITALIZE the stressed syllable>\n"
+                "SPEECH: <the same sounds respelled as simple lowercase English syllables "
+                "separated by spaces, no hyphens, no capitals — spelled so a US English "
+                "text-to-speech voice pronounces it correctly>\n\n"
                 f"Scientific name: {scientific_name}\n"
                 "Examples:\n"
-                "Sialia sialis → sy-AY-lee-ah sy-AY-lis\n"
-                "Cardinalis cardinalis → kar-DIN-ah-lis kar-DIN-ah-lis\n"
-                "Danaus plexippus → DAN-ay-us plek-SIP-us\n"
-                "Pantherophis alleghaniensis → pan-THEHR-oh-fis al-eh-GAY-nee-EN-sis"
+                "Sialia sialis →\nDISPLAY: sy-AY-lee-ah sy-AY-lis\nSPEECH: sigh ay lee ah, sigh ay liss\n"
+                "Danaus plexippus →\nDISPLAY: DAN-ay-us plek-SIP-us\nSPEECH: dan ay us, plek sip us\n"
+                "Laetiporus gilbertsonii →\nDISPLAY: lay-TIP-oh-rus gil-bert-SOH-nee-eye\n"
+                "SPEECH: lay tip oh rus, gil bert soh nee eye"
             )
             resp = self.client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,   # very low — we want consistent rule-following
-                max_tokens=80,
+                temperature=0.1,
+                max_tokens=120,
             )
-            result = resp.choices[0].message.content.strip().strip('"\'')
-            # Sanity check — should have hyphens and look like phonetics
-            if "-" in result and len(result) > 3:
-                return result
-            return ""
+            raw = resp.choices[0].message.content.strip()
+            display, speech = "", ""
+            for line in raw.splitlines():
+                s = line.strip().strip('"\'')
+                if s.upper().startswith("DISPLAY:"):
+                    display = s.split(":", 1)[1].strip()
+                elif s.upper().startswith("SPEECH:"):
+                    speech = s.split(":", 1)[1].strip()
+            # Fallbacks
+            if not display and "-" in raw:
+                display = raw.strip()
+            if not speech and display:
+                speech = display.replace("-", " ")
+            if display and "-" in display:
+                return display, (speech or display.replace("-", " "))
+            return "", ""
         except Exception:
-            return ""
+            return "", ""
 
 
 class ChatWorker(QThread):
@@ -2667,7 +2737,8 @@ class NatureDexWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._entry_content = QWidget()
-        self._entry_content.setStyleSheet("background: transparent;")
+        self._entry_content.setStyleSheet(f"background: {C_BG};")
+        self._entry_content.setAutoFillBackground(True)
         self._entry_inner = QVBoxLayout(self._entry_content)
         self._entry_inner.setContentsMargins(20, 20, 20, 20)
         self._entry_inner.setSpacing(14)
@@ -3540,59 +3611,68 @@ color:{C_SUBTEXT};font-size:14px;">
                             and len(sci.strip()) > 2)
 
         if sci and sci not in ("Unknown", "N/A", ""):
-            sci_row = QHBoxLayout()
-            sci_row.setSpacing(8)
+            sci_widget = QWidget()
+            sci_widget.setStyleSheet("background: transparent;")
+            sci_flow = FlowLayout(sci_widget, spacing=8)
+            _sp = sci_widget.sizePolicy(); _sp.setHeightForWidth(True)
+            sci_widget.setSizePolicy(_sp)
 
             sci_lbl = QLabel(sci)
             sci_lbl.setStyleSheet(
                 f"color: {C_TEXT}; font-size: 12px; font-style: italic; letter-spacing: 0.5px;")
-            sci_row.addWidget(sci_lbl)
+            sci_flow.addWidget(sci_lbl)
 
-            # Phonetic — only show if we have a real binomial name
-            phonetic = result.get("phonetic", "") if has_real_sci else ""
-            if phonetic:
-                phon_lbl = QLabel(f"  {phonetic}")
-                phon_lbl.setStyleSheet(
-                    f"color: {C_SUBTEXT}; font-size: 10px; letter-spacing: 0.3px;")
-                sci_row.addWidget(phon_lbl)
-
-            sci_row.addStretch()
-
-            # Speaker button — ONLY when we have a real binomial scientific name
+            # Speaker button — show for any real scientific name
             if has_real_sci:
                 speak_btn = QPushButton("🔊")
-                speak_btn.setFixedSize(24, 24)
+                speak_btn.setFixedSize(24, 22)
                 speak_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 speak_btn.setToolTip(f"Hear pronunciation of '{sci}'")
                 speak_btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: transparent;
-                        border: none;
-                        font-size: 13px;
-                        padding: 0;
+                        background: transparent; border: none;
+                        font-size: 13px; padding: 0;
                     }}
                     QPushButton:hover {{ background: {C_CARD}; border-radius: 4px; }}
                 """)
+                speak_str = result.get("phonetic_speech", "") or sci
                 speak_btn.clicked.connect(
-                    lambda checked, s=sci: subprocess.Popen(
-                        ["say", "-v", "Samantha", "-r", "110", s],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                )
-                sci_row.addWidget(speak_btn)
+                    lambda checked, s=speak_str: subprocess.Popen(
+                        ["say", "-v", "Samantha", "-r", "105", s],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                sci_flow.addWidget(speak_btn)
 
-            nf_layout.addLayout(sci_row)
+            phonetic = result.get("phonetic", "") if has_real_sci else ""
+            if phonetic:
+                phon_lbl = QLabel(phonetic)
+                phon_lbl.setStyleSheet(
+                    f"color: {C_SUBTEXT}; font-size: 10px; letter-spacing: 0.3px;")
+                sci_flow.addWidget(phon_lbl)
+
+            nf_layout.addWidget(sci_widget)
 
         conf       = result["confidence"]
         conf_color = C_GREEN if conf >= 75 else C_YELLOW if conf >= 50 else C_RED
-        conf_row   = QHBoxLayout()
-        conf_row.setSpacing(10)
+
+        # All metadata badges live in a flow layout so they wrap on narrow panels
+        meta_widget = QWidget()
+        meta_widget.setStyleSheet("background: transparent;")
+        meta_flow = FlowLayout(meta_widget, spacing=8)
+        _mp = meta_widget.sizePolicy(); _mp.setHeightForWidth(True)
+        meta_widget.setSizePolicy(_mp)
 
         conf_lbl = QLabel(f"CONFIDENCE  {conf:.1f}%")
         conf_lbl.setStyleSheet(
             f"color: {conf_color}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
-        conf_row.addWidget(conf_lbl)
+        meta_flow.addWidget(conf_lbl)
+
+        if cat:
+            cat_badge = QLabel(f"  {cat}  ")
+            cat_badge.setStyleSheet(
+                f"background: {C_BORDER}; color: {C_ACCENT}; font-size: 10px;"
+                f" font-weight: 700; border-radius: 4px; padding: 2px 6px;"
+                f" letter-spacing: 1px;")
+            meta_flow.addWidget(cat_badge)
 
         used_custom = result.get("used_custom_model", False)
         src         = result.get("model_source", "")
@@ -3602,41 +3682,22 @@ color:{C_SUBTEXT};font-size:14px;">
             badge_txt, badge_hot = "🌿 NatureDex Model", True
         else:
             badge_txt, badge_hot = "⚙ Unidentified", False
-        if result.get("native_nc"):
-            badge_txt += "    📍 Local species"
-            badge_hot = True
         model_badge = QLabel(badge_txt)
-        model_badge.setStyleSheet(f"""
-            color: {C_ACCENT if badge_hot else C_SUBTEXT};
-            font-size: 9px;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-        """)
+        model_badge.setStyleSheet(
+            f"color: {C_ACCENT if badge_hot else C_SUBTEXT}; font-size: 9px;"
+            f" font-weight: 700; letter-spacing: 0.5px;")
+        meta_flow.addWidget(model_badge)
 
-        if cat:
-            cat_badge = QLabel(f"  {cat}  ")
-            cat_badge.setStyleSheet(f"""
-                background: {C_BORDER};
-                color: {C_ACCENT};
-                font-size: 10px;
-                font-weight: 700;
-                border-radius: 4px;
-                padding: 2px 6px;
-                letter-spacing: 1px;
-            """)
-            conf_row.addWidget(cat_badge)
-        conf_row.addWidget(model_badge)
-        conf_row.addStretch()
-        nf_layout.addLayout(conf_row)
+        if result.get("native_nc"):
+            local_badge = QLabel("📍 Local species")
+            local_badge.setStyleSheet(
+                f"color: {C_ACCENT}; font-size: 9px; font-weight: 700; letter-spacing: 0.5px;")
+            meta_flow.addWidget(local_badge)
 
         rarity     = result.get("local_rarity") or result.get("rarity", "")
-        nc_obs     = result.get("nc_observations", None)
         inat       = result.get("inat", {})
         global_obs = inat.get("observations_count", 0)
-
         if rarity:
-            rarity_row = QHBoxLayout()
-            rarity_row.setSpacing(8)
             if "Very Rare" in rarity or "Not Recorded" in rarity:
                 rarity_color = C_PURPLE
             elif "Rare" in rarity:
@@ -3648,31 +3709,20 @@ color:{C_SUBTEXT};font-size:14px;">
             rarity_lbl = QLabel(f"◈  {rarity}")
             rarity_lbl.setStyleSheet(
                 f"color: {rarity_color}; font-size: 11px; font-weight: 700;")
-            rarity_row.addWidget(rarity_lbl)
+            meta_flow.addWidget(rarity_lbl)
             if global_obs:
-                global_lbl = QLabel(f"·  {global_obs:,} global observations")
+                global_lbl = QLabel(f"·  {global_obs:,} obs")
                 global_lbl.setStyleSheet(f"color: {C_SUBTEXT}; font-size: 10px;")
-                rarity_row.addWidget(global_lbl)
-            rarity_row.addStretch()
-            nf_layout.addLayout(rarity_row)
+                meta_flow.addWidget(global_lbl)
 
-        tags = entry.get("type_tags", [])
-        if tags:
-            tag_row = QHBoxLayout()
-            tag_row.setSpacing(6)
-            for tag in tags[:4]:
-                t_lbl = QLabel(tag)
-                t_lbl.setStyleSheet(f"""
-                    background: #1a3a2a;
-                    color: {C_GREEN};
-                    font-size: 10px;
-                    font-weight: 600;
-                    border-radius: 3px;
-                    padding: 2px 8px;
-                """)
-                tag_row.addWidget(t_lbl)
-            tag_row.addStretch()
-            nf_layout.addLayout(tag_row)
+        for tag in entry.get("type_tags", [])[:4]:
+            t_lbl = QLabel(tag)
+            t_lbl.setStyleSheet(
+                f"background: #1a3a2a; color: {C_GREEN}; font-size: 10px;"
+                f" font-weight: 600; border-radius: 3px; padding: 2px 8px;")
+            meta_flow.addWidget(t_lbl)
+
+        nf_layout.addWidget(meta_widget)
 
         self._entry_inner.addWidget(name_frame)
         self._fade_in(name_frame, 0)           # ← fade in immediately
@@ -3701,6 +3751,7 @@ color:{C_SUBTEXT};font-size:14px;">
             self._fade_in(desc_lbl, 80)        # ← fade in 80ms later
 
         nc_context = entry.get("north_carolina_context", "")
+        nc_obs = result.get("nc_observations", None)
         if nc_obs is not None and nc_obs > 0 and nc_context and nc_context not in ("Unknown", "N/A"):
             nc_context = f"{nc_context}  ({nc_obs:,} research-grade iNaturalist observations in NC)"
         elif nc_obs == 0 and nc_context not in ("Unknown", "N/A", ""):
